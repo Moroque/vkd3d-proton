@@ -613,6 +613,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"pipeline_library_log", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG},
     {"pipeline_library_ignore_spirv", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV},
     {"breadcrumbs", VKD3D_CONFIG_FLAG_BREADCRUMBS},
+    {"force_raw_va_cbv", VKD3D_CONFIG_FLAG_FORCE_RAW_VA_CBV},
 };
 
 static void vkd3d_config_flags_init_once(void)
