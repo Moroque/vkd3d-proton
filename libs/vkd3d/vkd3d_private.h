@@ -1659,12 +1659,14 @@ struct d3d12_pipeline_library
 
     size_t total_name_table_size;
     size_t total_blob_size;
+    bool internal_driver_cache;
 
     struct vkd3d_private_store private_store;
 };
 
 HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *blob,
-        size_t blob_length, struct d3d12_pipeline_library **pipeline_library);
+        size_t blob_length, bool internal_driver_cache,
+        struct d3d12_pipeline_library **pipeline_library);
 
 VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
         size_t size, const void *data, VkPipelineCache *cache);

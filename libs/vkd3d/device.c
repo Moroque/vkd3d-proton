@@ -4369,7 +4369,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineLibrary(d3d12_device
     TRACE("iface %p, blob %p, blob_size %lu, iid %s, lib %p.\n",
             iface, blob, blob_size, debugstr_guid(iid), lib);
 
-    if (FAILED(hr = d3d12_pipeline_library_create(device, blob, blob_size, &pipeline_library)))
+    if (FAILED(hr = d3d12_pipeline_library_create(device, blob, blob_size, false, &pipeline_library)))
         return hr;
 
     if (lib)

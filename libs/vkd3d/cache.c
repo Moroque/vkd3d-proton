@@ -1146,7 +1146,9 @@ static ULONG STDMETHODCALLTYPE d3d12_pipeline_library_Release(d3d12_pipeline_lib
     if (!refcount)
     {
         d3d12_pipeline_library_cleanup(pipeline_library, pipeline_library->device);
-        d3d12_device_release(pipeline_library->device);
+        /* Avoid reference cycle if this is a driver-internal pipeline cache. */
+        if (!pipeline_library->internal_driver_cache)
+            d3d12_device_release(pipeline_library->device);
         vkd3d_free(pipeline_library);
     }
 
@@ -1748,7 +1750,7 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
 }
 
 static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeline_library,
-        struct d3d12_device *device, const void *blob, size_t blob_length)
+        struct d3d12_device *device, const void *blob, size_t blob_length, bool internal_driver_cache)
 {
     HRESULT hr;
     int rc;
@@ -1773,8 +1775,10 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
             vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
     hash_map_init(&pipeline_library->driver_cache_map, vkd3d_cached_pipeline_hash_internal,
             vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
-    hash_map_init(&pipeline_library->pso_map, vkd3d_cached_pipeline_hash_name,
-            vkd3d_cached_pipeline_compare_name, sizeof(struct vkd3d_cached_pipeline_entry));
+    hash_map_init(&pipeline_library->pso_map,
+            internal_driver_cache ? vkd3d_cached_pipeline_hash_internal : vkd3d_cached_pipeline_hash_name,
+            internal_driver_cache ? vkd3d_cached_pipeline_compare_internal : vkd3d_cached_pipeline_compare_name,
+            sizeof(struct vkd3d_cached_pipeline_entry));
 
     if (blob_length)
     {
@@ -1785,7 +1789,11 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
     if (FAILED(hr = vkd3d_private_store_init(&pipeline_library->private_store)))
         goto cleanup_mutex;
 
-    d3d12_device_add_ref(pipeline_library->device = device);
+    pipeline_library->device = device;
+    pipeline_library->internal_driver_cache = internal_driver_cache;
+    /* Avoid reference cycle if this is a driver-internal pipeline cache. */
+    if (!internal_driver_cache)
+        d3d12_device_add_ref(pipeline_library->device);
     return hr;
 
 cleanup_hash_map:
@@ -1798,7 +1806,8 @@ cleanup_mutex:
 }
 
 HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *blob,
-        size_t blob_length, struct d3d12_pipeline_library **pipeline_library)
+        size_t blob_length, bool internal_driver_cache,
+        struct d3d12_pipeline_library **pipeline_library)
 {
     struct d3d12_pipeline_library *object;
     HRESULT hr;
@@ -1806,7 +1815,7 @@ HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *b
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_pipeline_library_init(object, device, blob, blob_length)))
+    if (FAILED(hr = d3d12_pipeline_library_init(object, device, blob, blob_length, internal_driver_cache)))
     {
         vkd3d_free(object);
         return hr;
