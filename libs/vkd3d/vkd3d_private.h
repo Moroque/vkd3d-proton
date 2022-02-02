@@ -1641,6 +1641,24 @@ static inline struct d3d12_pipeline_state *impl_from_ID3D12PipelineState(ID3D12P
 /* ID3D12PipelineLibrary */
 typedef ID3D12PipelineLibrary1 d3d12_pipeline_library_iface;
 
+struct vkd3d_pipeline_library_disk_cache
+{
+    /* This memory is generally mapped with MapViewOfFile() or mmap(),
+     * and must remain mapped for the duration of the library. */
+    void *mapped;
+    size_t mapped_size;
+    struct d3d12_pipeline_library *library;
+
+    pthread_t thread;
+    condvar_reltime_t cond;
+    pthread_mutex_t lock;
+    bool thread_active;
+    bool internal_driver_cache_dirty;
+
+    char path[VKD3D_PATH_MAX];
+    char tmp_path[VKD3D_PATH_MAX];
+};
+
 struct d3d12_pipeline_library
 {
     d3d12_pipeline_library_iface ID3D12PipelineLibrary_iface;
@@ -1683,6 +1701,20 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct vkd3d_pipeline_cache_compatibility *compat);
 void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_compatibility *compat,
         const struct d3d12_pipeline_state_desc *desc);
+
+/* For internal on-disk pipeline cache fallback. The key to Load/StorePipeline is implied by the PSO cache compatibility. */
+HRESULT vkd3d_pipeline_library_store_pipeline_to_disk_cache(struct vkd3d_pipeline_library_disk_cache *pipeline_library,
+        const struct vkd3d_pipeline_cache_compatibility *compat,
+        struct d3d12_pipeline_state *state);
+HRESULT vkd3d_pipeline_library_find_cached_blob_from_disk_cache(struct vkd3d_pipeline_library_disk_cache *pipeline_library,
+        const struct vkd3d_pipeline_cache_compatibility *compat,
+        struct d3d12_cached_pipeline_state *cached_state);
+
+/* Called on device init. */
+HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
+        struct d3d12_device *device);
+/* Called on device destroy. */
+void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache);
 
 struct vkd3d_buffer
 {
