@@ -552,7 +552,7 @@ static uint32_t d3d12_cached_pipeline_entry_name_table_size(const struct vkd3d_c
         return sizeof(entry->key.internal_key_hash);
 }
 
-static bool d3d12_pipeline_library_insert_hash_map_blob(struct d3d12_pipeline_library *pipeline_library,
+static bool d3d12_pipeline_library_insert_hash_map_blob_locked(struct d3d12_pipeline_library *pipeline_library,
         struct hash_map *map, const struct vkd3d_cached_pipeline_entry *entry)
 {
     const struct vkd3d_cached_pipeline_entry *new_entry;
@@ -565,6 +565,48 @@ static bool d3d12_pipeline_library_insert_hash_map_blob(struct d3d12_pipeline_li
     }
     else
         return false;
+}
+
+static bool d3d12_pipeline_library_insert_hash_map_blob_internal(struct d3d12_pipeline_library *pipeline_library,
+        struct hash_map *map, const struct vkd3d_cached_pipeline_entry *entry)
+{
+    /* Used for internal hashmap updates. We expect reasonable amount of duplicates,
+     * prefer read -> write promotion. */
+    const struct vkd3d_cached_pipeline_entry *new_entry;
+    bool ret;
+    int rc;
+
+    if ((rc = rwlock_lock_read(&pipeline_library->internal_hashmap_mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        return false;
+    }
+
+    if (hash_map_find(map, &entry->key))
+    {
+        rwlock_unlock_read(&pipeline_library->internal_hashmap_mutex);
+        return false;
+    }
+
+    rwlock_unlock_read(&pipeline_library->internal_hashmap_mutex);
+    if ((rc = rwlock_lock_write(&pipeline_library->internal_hashmap_mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        return false;
+    }
+
+    if ((new_entry = (const struct vkd3d_cached_pipeline_entry*)hash_map_insert(map, &entry->key, &entry->entry)) &&
+            new_entry->data.blob == entry->data.blob)
+    {
+        pipeline_library->total_name_table_size += d3d12_cached_pipeline_entry_name_table_size(entry);
+        pipeline_library->total_blob_size += align(entry->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
+        ret = true;
+    }
+    else
+        ret = false;
+
+    rwlock_unlock_write(&pipeline_library->internal_hashmap_mutex);
+    return ret;
 }
 
 static size_t vkd3d_shader_code_compute_serialized_size(const struct vkd3d_shader_code *code,
@@ -660,7 +702,7 @@ static void vkd3d_shader_code_serialize_referenced(struct d3d12_pipeline_library
         internal->checksum = vkd3d_pipeline_blob_compute_data_checksum(internal->data, wrapped_varint_size);
 
         /* For duplicate, we won't insert. Just free the blob. */
-        if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library,
+        if (!d3d12_pipeline_library_insert_hash_map_blob_internal(pipeline_library,
                 &pipeline_library->spirv_cache_map, &entry))
         {
             vkd3d_free(internal);
@@ -780,7 +822,7 @@ static VkResult vkd3d_serialize_pipeline_state_referenced(struct d3d12_pipeline_
         internal->checksum = vkd3d_pipeline_blob_compute_data_checksum(blob.code, blob.size);
 
         /* For duplicate, we won't insert. Just free the blob. */
-        if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library,
+        if (!d3d12_pipeline_library_insert_hash_map_blob_internal(pipeline_library,
                 &pipeline_library->driver_cache_map, &entry))
         {
             vkd3d_free(internal);
@@ -1059,6 +1101,7 @@ static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeli
 
     vkd3d_private_store_destroy(&pipeline_library->private_store);
     rwlock_destroy(&pipeline_library->mutex);
+    rwlock_destroy(&pipeline_library->internal_hashmap_mutex);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_QueryInterface(d3d12_pipeline_library_iface *iface,
@@ -1160,11 +1203,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     struct vkd3d_cached_pipeline_entry entry;
     void *new_name, *new_blob;
     VkResult vr;
+    HRESULT hr;
     int rc;
 
     TRACE("iface %p, name %s, pipeline %p.\n", iface, debugstr_w(name), pipeline);
 
-    if ((rc = rwlock_lock_write(&pipeline_library->mutex)))
+    if ((rc = rwlock_lock_read(&pipeline_library->mutex)))
     {
         ERR("Failed to lock mutex, rc %d.\n", rc);
         return hresult_from_errno(rc);
@@ -1177,14 +1221,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     if (hash_map_find(&pipeline_library->pso_map, &entry.key))
     {
         WARN("Pipeline %s already exists.\n", debugstr_w(name));
-        rwlock_unlock_write(&pipeline_library->mutex);
+        rwlock_unlock_read(&pipeline_library->mutex);
         return E_INVALIDARG;
     }
 
     /* We need to allocate persistent storage for the name */
     if (!(new_name = malloc(entry.key.name_length)))
     {
-        rwlock_unlock_write(&pipeline_library->mutex);
+        rwlock_unlock_read(&pipeline_library->mutex);
         return E_OUTOFMEMORY;
     }
 
@@ -1194,14 +1238,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     if (FAILED(vr = vkd3d_serialize_pipeline_state(pipeline_library, pipeline_state, &entry.data.blob_length, NULL)))
     {
         vkd3d_free(new_name);
-        rwlock_unlock_write(&pipeline_library->mutex);
+        rwlock_unlock_read(&pipeline_library->mutex);
         return hresult_from_vk_result(vr);
     }
 
     if (!(new_blob = malloc(entry.data.blob_length)))
     {
         vkd3d_free(new_name);
-        rwlock_unlock_write(&pipeline_library->mutex);
+        rwlock_unlock_read(&pipeline_library->mutex);
         return E_OUTOFMEMORY;
     }
 
@@ -1209,23 +1253,45 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     {
         vkd3d_free(new_name);
         vkd3d_free(new_blob);
-        rwlock_unlock_write(&pipeline_library->mutex);
+        rwlock_unlock_read(&pipeline_library->mutex);
         return hresult_from_vk_result(vr);
     }
 
     entry.data.blob = new_blob;
     entry.data.is_new = 1;
+    rwlock_unlock_read(&pipeline_library->mutex);
 
-    if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, &pipeline_library->pso_map, &entry))
+    /* Now is the time to promote to a writer lock. */
+    if ((rc = rwlock_lock_write(&pipeline_library->mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        vkd3d_free(new_name);
+        vkd3d_free(new_blob);
+        return hresult_from_errno(rc);
+    }
+
+    /* Detected duplicate late, but be accurate in how we report this. */
+    if (hash_map_find(&pipeline_library->pso_map, &entry.key))
+    {
+        WARN("Pipeline %s already exists.\n", debugstr_w(name));
+        hr = E_INVALIDARG;
+    }
+    else if (!d3d12_pipeline_library_insert_hash_map_blob_locked(pipeline_library, &pipeline_library->pso_map, &entry))
+    {
+        /* This path shouldn't happen unless there are OOM scenarios. */
+        hr = E_OUTOFMEMORY;
+    }
+    else
+        hr = S_OK;
+
+    rwlock_unlock_write(&pipeline_library->mutex);
+
+    if (FAILED(hr))
     {
         vkd3d_free(new_name);
         vkd3d_free(new_blob);
-        rwlock_unlock_write(&pipeline_library->mutex);
-        return E_OUTOFMEMORY;
     }
-
-    rwlock_unlock_write(&pipeline_library->mutex);
-    return S_OK;
+    return hr;
 }
 
 static HRESULT d3d12_pipeline_library_load_pipeline(struct d3d12_pipeline_library *pipeline_library, LPCWSTR name,
@@ -1336,9 +1402,17 @@ static SIZE_T STDMETHODCALLTYPE d3d12_pipeline_library_GetSerializedSize(d3d12_p
         return 0;
     }
 
+    if ((rc = rwlock_lock_read(&pipeline_library->internal_hashmap_mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        rwlock_unlock_read(&pipeline_library->mutex);
+        return 0;
+    }
+
     total_size = d3d12_pipeline_library_get_serialized_size(pipeline_library);
 
     rwlock_unlock_read(&pipeline_library->mutex);
+    rwlock_unlock_read(&pipeline_library->internal_hashmap_mutex);
     return total_size;
 }
 
@@ -1454,8 +1528,16 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
         return E_FAIL;
     }
 
+    if ((rc = rwlock_lock_read(&pipeline_library->internal_hashmap_mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        rwlock_unlock_read(&pipeline_library->mutex);
+        return E_FAIL;
+    }
+
     hr = d3d12_pipeline_library_serialize(pipeline_library, data, data_size);
     rwlock_unlock_read(&pipeline_library->mutex);
+    rwlock_unlock_read(&pipeline_library->internal_hashmap_mutex);
     return hr;
 }
 
@@ -1552,7 +1634,7 @@ static HRESULT d3d12_pipeline_library_unserialize_hash_map(
         entry.data.blob = serialized_data_base + toc_entry->blob_offset;
         entry.data.is_new = 0;
 
-        if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, map, &entry))
+        if (!d3d12_pipeline_library_insert_hash_map_blob_locked(pipeline_library, map, &entry))
             return E_OUTOFMEMORY;
     }
 
@@ -1680,6 +1762,12 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
 
     if ((rc = rwlock_init(&pipeline_library->mutex)))
         return hresult_from_errno(rc);
+
+    if ((rc = rwlock_init(&pipeline_library->internal_hashmap_mutex)))
+    {
+        rwlock_destroy(&pipeline_library->mutex);
+        return hresult_from_errno(rc);
+    }
 
     hash_map_init(&pipeline_library->spirv_cache_map, vkd3d_cached_pipeline_hash_internal,
             vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
