@@ -2722,6 +2722,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     vkd3d_cleanup_format_info(device);
     vkd3d_memory_info_cleanup(&device->memory_info, device);
     vkd3d_shader_debug_ring_cleanup(&device->debug_ring, device);
+    vkd3d_pipeline_library_flush_disk_cache(&device->disk_cache);
     d3d12_device_global_pipeline_cache_cleanup(device);
     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
     vkd3d_view_map_destroy(&device->sampler_map, device);
@@ -6016,6 +6017,10 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     vkd3d_init_shader_extensions(device);
     vkd3d_compute_shader_interface_key(device);
 
+    /* Make sure all extensions and shader interface keys are computed. */
+    if (FAILED(hr = vkd3d_pipeline_library_init_disk_cache(&device->disk_cache, device)))
+        goto out_cleanup_descriptor_qa_global_info;
+
 #ifdef VKD3D_ENABLE_RENDERDOC
     if (vkd3d_renderdoc_active() && vkd3d_renderdoc_global_capture_enabled())
         vkd3d_renderdoc_begin_capture(device->vkd3d_instance->vk_instance);
@@ -6023,6 +6028,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     return S_OK;
 
+out_cleanup_descriptor_qa_global_info:
+    vkd3d_descriptor_debug_free_global_info(device->descriptor_qa_global_info, device);
 out_cleanup_global_pipeline_cache:
     d3d12_device_global_pipeline_cache_cleanup(device);
 out_cleanup_debug_ring:
