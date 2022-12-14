@@ -293,42 +293,6 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
     return true;
 }
 
-static bool vkd3d_is_linear_tiling_supported(const struct d3d12_device *device, VkImageCreateInfo *image_info)
-{
-    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkImageFormatProperties properties;
-    bool supported;
-    VkResult vr;
-
-    if ((vr = VK_CALL(vkGetPhysicalDeviceImageFormatProperties(device->vk_physical_device, image_info->format,
-            image_info->imageType, VK_IMAGE_TILING_LINEAR, image_info->usage, image_info->flags, &properties))) < 0)
-    {
-        if (vr != VK_ERROR_FORMAT_NOT_SUPPORTED)
-            WARN("Failed to get device image format properties, vr %d.\n", vr);
-        else
-        {
-            WARN("Attempting to create linear image, but not supported.\n"
-                  "usage: %#x, flags: %#x, fmt: %u, image_type: %u\n",
-                  image_info->usage, image_info->flags, image_info->format, image_info->imageType);
-        }
-
-        return false;
-    }
-
-    supported = image_info->extent.depth <= properties.maxExtent.depth
-            && image_info->mipLevels <= properties.maxMipLevels
-            && image_info->arrayLayers <= properties.maxArrayLayers
-            && (image_info->samples & properties.sampleCounts);
-
-    if (!supported)
-    {
-        WARN("Linear tiling not supported for mipLevels = %u, arrayLayers = %u, sampes = %u, depth = %u.\n",
-                image_info->mipLevels, image_info->arrayLayers, image_info->samples, image_info->extent.depth);
-    }
-
-    return supported;
-}
-
 static bool d3d12_device_prefers_general_depth_stencil(const struct d3d12_device *device)
 {
     if (device->vk_info.KHR_driver_properties)
@@ -556,6 +520,13 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         format = resource->format;
     }
 
+    if (heap_properties && is_cpu_accessible_heap(heap_properties) &&
+            (format->vk_aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+    {
+        FIXME("Creating host-visible depth-stencil images not supported.\n");
+        return E_NOTIMPL;
+    }
+
     image_info->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info->pNext = NULL;
     image_info->flags = 0;
@@ -631,6 +602,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     image_info->mipLevels = min(desc->MipLevels, max_miplevel_count(desc));
     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
+    image_info->tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (sparse_resource)
     {
@@ -639,19 +612,10 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
             WARN("D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE must be used for reserved texture.\n");
             return E_INVALIDARG;
         }
-
-        image_info->tiling = VK_IMAGE_TILING_OPTIMAL;
     }
-    else if (desc->Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN || desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
+    else if (desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
     {
-        image_info->tiling = VK_IMAGE_TILING_OPTIMAL;
-    }
-    else if (desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
-    {
-        image_info->tiling = VK_IMAGE_TILING_LINEAR;
-    }
-    else
-    {
+        /* ROW_MAJOR is only supported for cross-adapter sharing, which we don't support */
         FIXME("Unsupported layout %#x.\n", desc->Layout);
         return E_NOTIMPL;
     }
@@ -682,19 +646,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
             (image_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         image_info->flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
 
-    use_concurrent = !!(device->unique_queue_mask & (device->unique_queue_mask - 1));
-
-    if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
-    {
-        /* Ignore config flags for actual simultaneous access cases. */
-        if (((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
-                (vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_RTV_EXCLUSIVE_QUEUE)) ||
-                ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
-                 (vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_DSV_EXCLUSIVE_QUEUE)))
-        {
-            use_concurrent = false;
-        }
-    }
+    use_concurrent = !!(device->unique_queue_mask & (device->unique_queue_mask - 1)) ||
+            (heap_properties && is_cpu_accessible_heap(heap_properties));
 
     if (use_concurrent)
     {
@@ -711,52 +664,9 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         image_info->pQueueFamilyIndices = NULL;
     }
 
-    if (heap_properties && is_cpu_accessible_heap(heap_properties))
-    {
-        image_info->initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
-        /* Required for ReadFromSubresource(). */
-        image_info->tiling = VK_IMAGE_TILING_LINEAR;
-
-        if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_IGNORE_RTV_HOST_VISIBLE) &&
-                (image_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
-        {
-            WARN("Workaround applied. Ignoring RTV on linear resources.\n");
-            image_info->usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-            if (resource)
-                resource->desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        }
-    }
-    else
-    {
-        image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-
     if ((image_info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
             !vkd3d_format_check_usage_support(device, format->vk_format, image_info->usage, image_info->tiling))
         image_info->flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-
-    if (image_info->tiling == VK_IMAGE_TILING_LINEAR)
-    {
-        bool supported = vkd3d_is_linear_tiling_supported(device, image_info);
-
-        /* Apparently NV drivers do not support EXTENDED_USAGE_BIT on linear images? */
-        if (!supported && (image_info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT))
-        {
-            WARN("Linear image not supported, attempting without EXTENDED_USAGE as a workaround ...\n");
-            image_info->flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-            supported = vkd3d_is_linear_tiling_supported(device, image_info);
-        }
-
-        if (!supported)
-        {
-            WARN("Linear image not supported, forcing OPTIMAL tiling ...\n");
-            image_info->tiling = VK_IMAGE_TILING_OPTIMAL;
-
-            if ((image_info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-                    !vkd3d_format_check_usage_support(device, format->vk_format, image_info->usage, image_info->tiling))
-                image_info->flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        }
-    }
 
     if (sparse_resource)
     {
@@ -792,9 +702,10 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     if (resource)
     {
-        if (image_info->tiling == VK_IMAGE_TILING_LINEAR)
+        if (heap_properties && is_cpu_accessible_heap(heap_properties))
         {
-            resource->flags |= VKD3D_RESOURCE_LINEAR_TILING;
+            /* Required for ReadFrom/WriteToSubresource */
+            resource->flags |= VKD3D_RESOURCE_SIMULTANEOUS_ACCESS;
             resource->common_layout = VK_IMAGE_LAYOUT_GENERAL;
         }
         else
@@ -825,6 +736,9 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
 
     return hresult_from_vk_result(vr);
 }
+
+static size_t vkd3d_compute_resource_layouts_from_desc(struct d3d12_device *device,
+        const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_subresource_layout *layouts);
 
 HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_ALLOCATION_INFO *allocation_info)
@@ -1450,7 +1364,7 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
 
 static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12_device *device);
 
-static ULONG d3d12_resource_incref(struct d3d12_resource *resource)
+ULONG d3d12_resource_incref(struct d3d12_resource *resource)
 {
     ULONG refcount = InterlockedIncrement(&resource->internal_refcount);
 
@@ -1459,7 +1373,7 @@ static ULONG d3d12_resource_incref(struct d3d12_resource *resource)
     return refcount;
 }
 
-static ULONG d3d12_resource_decref(struct d3d12_resource *resource)
+ULONG d3d12_resource_decref(struct d3d12_resource *resource)
 {
     ULONG refcount = InterlockedDecrement(&resource->internal_refcount);
 
@@ -1799,10 +1713,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_WriteToSubresource(d3d12_resourc
         UINT src_row_pitch, UINT src_slice_pitch)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
-    const struct vkd3d_vk_device_procs *vk_procs;
-    VkImageSubresource vk_sub_resource;
-    VkSubresourceLayout vk_layout;
-    struct d3d12_device *device;
+    struct vkd3d_subresource_layout *subresource_layout;
+    struct d3d12_device *device = resource->device;
+    VkExtent3D extent;
+    VkOffset3D offset;
     uint8_t *dst_data;
     D3D12_BOX box;
 
@@ -1816,22 +1730,15 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_WriteToSubresource(d3d12_resourc
         return E_INVALIDARG;
     }
 
-    device = resource->device;
-    vk_procs = &device->vk_procs;
-
     if (resource->format->vk_aspect_mask != VK_IMAGE_ASPECT_COLOR_BIT)
     {
         FIXME("Not supported for format %#x.\n", resource->format->dxgi_format);
         return E_NOTIMPL;
     }
 
-    vk_sub_resource.arrayLayer = dst_sub_resource / resource->desc.MipLevels;
-    vk_sub_resource.mipLevel = dst_sub_resource % resource->desc.MipLevels;
-    vk_sub_resource.aspectMask = resource->format->vk_aspect_mask;
-
     if (!dst_box)
     {
-        d3d12_resource_get_level_box(resource, vk_sub_resource.mipLevel, &box);
+        d3d12_resource_get_level_box(resource, dst_sub_resource % resource->desc.MipLevels, &box);
         dst_box = &box;
     }
     else if (!d3d12_resource_validate_box(resource, dst_sub_resource, dst_box))
@@ -1851,26 +1758,29 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_WriteToSubresource(d3d12_resourc
         FIXME_ONCE("Not implemented for this resource type.\n");
         return E_NOTIMPL;
     }
-    if (!(resource->flags & VKD3D_RESOURCE_LINEAR_TILING))
-    {
-        FIXME_ONCE("Not implemented for image tiling other than VK_IMAGE_TILING_LINEAR.\n");
-        return E_NOTIMPL;
-    }
 
-    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &vk_sub_resource, &vk_layout));
-    TRACE("Offset %#"PRIx64", size %#"PRIx64", row pitch %#"PRIx64", depth pitch %#"PRIx64".\n",
-            vk_layout.offset, vk_layout.size, vk_layout.rowPitch, vk_layout.depthPitch);
+    offset.x = dst_box->left;
+    offset.y = dst_box->top;
+    offset.z = dst_box->front;
+
+    extent.width = dst_box->right - dst_box->left;
+    extent.height = dst_box->bottom - dst_box->top;
+    extent.depth = dst_box->back - dst_box->front;
+
+    subresource_layout = &resource->subresource_layouts[dst_sub_resource];
+    TRACE("Offset %#"PRIx64", row pitch %#"PRIx64", depth pitch %#"PRIx64".\n",
+            subresource_layout->offset, subresource_layout->row_pitch, subresource_layout->depth_pitch);
 
     d3d12_resource_get_map_ptr(resource, (void **)&dst_data);
 
-    dst_data += vk_layout.offset + vkd3d_format_get_data_offset(resource->format, vk_layout.rowPitch,
-            vk_layout.depthPitch, dst_box->left, dst_box->top, dst_box->front);
+    dst_data += subresource_layout->offset + vkd3d_format_get_data_offset(resource->format,
+            subresource_layout->row_pitch, subresource_layout->depth_pitch, offset.x, offset.y, offset.z);
 
-    vkd3d_format_copy_data(resource->format, src_data, src_row_pitch, src_slice_pitch,
-            dst_data, vk_layout.rowPitch, vk_layout.depthPitch, dst_box->right - dst_box->left,
-            dst_box->bottom - dst_box->top, dst_box->back - dst_box->front);
+    vkd3d_format_copy_data(resource->format, src_data, src_row_pitch, src_slice_pitch, dst_data,
+            subresource_layout->row_pitch, subresource_layout->depth_pitch, extent.width, extent.height, extent.depth);
 
-    return S_OK;
+    return vkd3d_memory_transfer_queue_write_subresource(&device->memory_transfers,
+            resource, dst_sub_resource, offset, extent);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_resource_ReadFromSubresource(d3d12_resource_iface *iface,
@@ -1878,10 +1788,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_ReadFromSubresource(d3d12_resour
         UINT src_sub_resource, const D3D12_BOX *src_box)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
-    const struct vkd3d_vk_device_procs *vk_procs;
-    VkImageSubresource vk_sub_resource;
-    VkSubresourceLayout vk_layout;
-    struct d3d12_device *device;
+    struct vkd3d_subresource_layout *subresource_layout;
     uint8_t *src_data;
     D3D12_BOX box;
 
@@ -1895,22 +1802,15 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_ReadFromSubresource(d3d12_resour
         return E_INVALIDARG;
     }
 
-    device = resource->device;
-    vk_procs = &device->vk_procs;
-
     if (resource->format->vk_aspect_mask != VK_IMAGE_ASPECT_COLOR_BIT)
     {
         FIXME("Not supported for format %#x.\n", resource->format->dxgi_format);
         return E_NOTIMPL;
     }
 
-    vk_sub_resource.arrayLayer = src_sub_resource / resource->desc.MipLevels;
-    vk_sub_resource.mipLevel = src_sub_resource % resource->desc.MipLevels;
-    vk_sub_resource.aspectMask = resource->format->vk_aspect_mask;
-
     if (!src_box)
     {
-        d3d12_resource_get_level_box(resource, vk_sub_resource.mipLevel, &box);
+        d3d12_resource_get_level_box(resource, src_sub_resource % resource->desc.MipLevels, &box);
         src_box = &box;
     }
     else if (!d3d12_resource_validate_box(resource, src_sub_resource, src_box))
@@ -1930,24 +1830,19 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_ReadFromSubresource(d3d12_resour
         FIXME_ONCE("Not implemented for this resource type.\n");
         return E_NOTIMPL;
     }
-    if (!(resource->flags & VKD3D_RESOURCE_LINEAR_TILING))
-    {
-        FIXME_ONCE("Not implemented for image tiling other than VK_IMAGE_TILING_LINEAR.\n");
-        return E_NOTIMPL;
-    }
 
-    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &vk_sub_resource, &vk_layout));
-    TRACE("Offset %#"PRIx64", size %#"PRIx64", row pitch %#"PRIx64", depth pitch %#"PRIx64".\n",
-            vk_layout.offset, vk_layout.size, vk_layout.rowPitch, vk_layout.depthPitch);
+    subresource_layout = &resource->subresource_layouts[src_sub_resource];
+    TRACE("Offset %#"PRIx64", row pitch %#"PRIx64", depth pitch %#"PRIx64".\n",
+            subresource_layout->offset, subresource_layout->row_pitch, subresource_layout->depth_pitch);
 
     d3d12_resource_get_map_ptr(resource, (void **)&src_data);
 
-    src_data += vk_layout.offset + vkd3d_format_get_data_offset(resource->format, vk_layout.rowPitch,
-            vk_layout.depthPitch, src_box->left, src_box->top, src_box->front);
+    src_data += subresource_layout->offset + vkd3d_format_get_data_offset(resource->format,
+            subresource_layout->row_pitch, subresource_layout->depth_pitch, src_box->left, src_box->top, src_box->front);
 
-    vkd3d_format_copy_data(resource->format, src_data, vk_layout.rowPitch, vk_layout.depthPitch,
-            dst_data, dst_row_pitch, dst_slice_pitch, src_box->right - src_box->left,
-            src_box->bottom - src_box->top, src_box->back - src_box->front);
+    vkd3d_format_copy_data(resource->format, src_data, subresource_layout->row_pitch,
+            subresource_layout->depth_pitch, dst_data, dst_row_pitch, dst_slice_pitch,
+            src_box->right - src_box->left, src_box->bottom - src_box->top, src_box->back - src_box->front);
 
     return S_OK;
 }
@@ -2073,6 +1968,28 @@ VkImageSubresource vk_image_subresource_from_d3d12(
     }
 
     return subresource;
+}
+
+UINT d3d12_plane_index_from_vk_aspect(VkImageAspectFlagBits aspect)
+{
+    switch (aspect)
+    {
+        case VK_IMAGE_ASPECT_COLOR_BIT:
+        case VK_IMAGE_ASPECT_DEPTH_BIT:
+        case VK_IMAGE_ASPECT_PLANE_0_BIT:
+            return 0;
+
+        case VK_IMAGE_ASPECT_STENCIL_BIT:
+        case VK_IMAGE_ASPECT_PLANE_1_BIT:
+            return 1;
+
+        case VK_IMAGE_ASPECT_PLANE_2_BIT:
+            return 2;
+
+        default:
+            WARN("Unsupported image aspect: %u.\n", aspect);
+            return 0;
+    }
 }
 
 VkImageSubresource d3d12_resource_get_vk_subresource(const struct d3d12_resource *resource,
@@ -2665,6 +2582,14 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.device_allocation.vk_memory)
         vkd3d_free_memory(device, &device->memory_allocator, &resource->mem);
 
+    if (resource->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
+    {
+        if (resource->private_mem.device_allocation.vk_memory)
+            vkd3d_free_memory(device, &device->memory_allocator, &resource->private_mem);
+
+        vkd3d_free(resource->subresource_layouts);
+    }
+
     if (resource->vrs_view)
         VK_CALL(vkDestroyImageView(device->vk_device, resource->vrs_view, NULL));
 
@@ -2706,6 +2631,51 @@ static HRESULT d3d12_resource_create_vk_resource(struct d3d12_resource *resource
     }
 
     return S_OK;
+}
+
+static size_t vkd3d_compute_resource_layouts_from_desc(struct d3d12_device *device,
+        const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_subresource_layout *layouts)
+{
+    struct vkd3d_format_footprint format_footprint;
+    const struct vkd3d_format *format;
+    unsigned int i, subresource_count;
+    uint32_t plane_idx, mip_idx;
+    VkExtent3D block_count;
+    size_t offset = 0;
+
+    subresource_count = d3d12_resource_desc_get_sub_resource_count(device, desc);
+    format = vkd3d_format_from_d3d12_resource_desc(device, desc, 0);
+
+    for (i = 0; i < subresource_count; i++)
+    {
+        plane_idx = i / d3d12_resource_desc_get_sub_resource_count_per_plane(desc);
+        mip_idx = i % desc->MipLevels;
+
+        format_footprint = vkd3d_format_footprint_for_plane(format, plane_idx);
+
+        block_count.width = align(d3d12_resource_desc_get_width(desc, mip_idx + format_footprint.subsample_x_log2), format_footprint.block_width) / format_footprint.block_width;
+        block_count.height = align(d3d12_resource_desc_get_height(desc, mip_idx + format_footprint.subsample_y_log2), format_footprint.block_height) / format_footprint.block_height;
+        block_count.depth = d3d12_resource_desc_get_depth(desc, mip_idx);
+
+        if (layouts)
+        {
+            layouts[i].offset = offset;
+            layouts[i].row_pitch = block_count.width * format_footprint.block_byte_count;
+            layouts[i].depth_pitch = block_count.height * layouts[i].row_pitch;
+        }
+
+        offset += block_count.width * block_count.height * block_count.depth * format_footprint.block_byte_count;
+    }
+
+    return offset;
+}
+
+static size_t d3d12_resource_init_subresource_layouts(struct d3d12_resource *resource, struct d3d12_device *device)
+{
+    unsigned int subresource_count = d3d12_resource_get_sub_resource_count(resource);
+
+    resource->subresource_layouts = vkd3d_calloc(subresource_count, sizeof(*resource->subresource_layouts));
+    return vkd3d_compute_resource_layouts_from_desc(device, &resource->desc, resource->subresource_layouts);
 }
 
 static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags,
@@ -2759,6 +2729,20 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
         object->heap_properties = *heap_properties;
     object->heap_flags = heap_flags;
 
+    /* Compute subresource layouts for CPU-accessible images. CPU-accessible
+     * heaps cannot be shared, so we do not need to consider that possibility. */
+    if (!(flags & VKD3D_RESOURCE_RESERVED) && d3d12_resource_is_texture(object) &&
+            is_cpu_accessible_heap(heap_properties))
+    {
+        const UINT unsupported_flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        object->flags |= VKD3D_RESOURCE_LINEAR_STAGING_COPY;
+        d3d12_resource_init_subresource_layouts(object, device);
+
+        if ((desc->Flags & unsupported_flags) == unsupported_flags)
+            FIXME_ONCE("ReadFromSubresource may be buggy on host-visible images with ALLOW_SIMULTANEOUS_ACCESS | ALLOW_UNORDERED_ACCESS.\n");
+    }
+
     d3d12_device_add_ref(device);
 
     vkd3d_descriptor_debug_register_resource_cookie(device->descriptor_qa_global_info,
@@ -2785,6 +2769,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         VkMemoryDedicatedRequirements dedicated_requirements;
         struct vkd3d_allocate_memory_info allocate_info;
         VkMemoryDedicatedAllocateInfo dedicated_info;
+        struct vkd3d_memory_allocation *allocation;
         VkImageMemoryRequirementsInfo2 image_info;
         VkMemoryRequirements2 memory_requirements;
         VkBindImageMemoryInfo bind_info;
@@ -2811,17 +2796,29 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
 
         VK_CALL(vkGetImageMemoryRequirements2(device->vk_device, &image_info, &memory_requirements));
 
+        memset(&allocate_info, 0, sizeof(allocate_info));
+        allocate_info.memory_requirements = memory_requirements.memoryRequirements;
+        allocate_info.heap_flags = heap_flags;
+
+        if (object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
+        {
+            assert(!(heap_flags & D3D12_HEAP_FLAG_SHARED));
+            /* For host-visible images, allocate the actual image resource in video memory */
+            allocate_info.heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            allocation = &object->private_mem;
+        }
+        else
+        {
+            allocate_info.heap_properties = *heap_properties;
+            allocation = &object->mem;
+        }
+
         if (!(use_dedicated_allocation = dedicated_requirements.prefersDedicatedAllocation))
         {
             const uint32_t type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
-            const struct vkd3d_memory_info_domain *domain = d3d12_device_get_memory_info_domain(device, heap_properties);
+            const struct vkd3d_memory_info_domain *domain = d3d12_device_get_memory_info_domain(device, &allocate_info.heap_properties);
             use_dedicated_allocation = (type_mask & domain->buffer_type_mask) != type_mask;
         }
-
-        memset(&allocate_info, 0, sizeof(allocate_info));
-        allocate_info.memory_requirements = memory_requirements.memoryRequirements;
-        allocate_info.heap_properties = *heap_properties;
-        allocate_info.heap_flags = heap_flags;
 
         if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
             allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
@@ -2871,14 +2868,14 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             allocate_info.flags = VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER;
         }
 
-        if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, &object->mem)))
+        if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
             goto fail;
 
         bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
         bind_info.pNext = NULL;
         bind_info.image = object->res.vk_image;
-        bind_info.memory = object->mem.device_allocation.vk_memory;
-        bind_info.memoryOffset = object->mem.offset;
+        bind_info.memory = allocation->device_allocation.vk_memory;
+        bind_info.memoryOffset = allocation->offset;
 
         if ((vr = VK_CALL(vkBindImageMemory2KHR(device->vk_device, 1, &bind_info))))
         {
@@ -2891,6 +2888,20 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         {
             /* Make the implicit VRS view here... */
             if (FAILED(hr = vkd3d_resource_make_vrs_view(device, object->res.vk_image, &object->vrs_view)))
+                goto fail;
+        }
+
+        if (object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
+        {
+            memset(&allocate_info, 0, sizeof(allocate_info));
+            allocate_info.memory_requirements.size = vkd3d_compute_resource_layouts_from_desc(device, desc, NULL);
+            allocate_info.memory_requirements.alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            allocate_info.memory_requirements.memoryTypeBits = ~0u;
+            allocate_info.heap_properties = *heap_properties;
+            allocate_info.heap_flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+            allocate_info.flags = VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER;
+
+            if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, &object->mem)))
                 goto fail;
         }
     }
@@ -2960,27 +2971,19 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct vkd3d_allocate_memory_info allocate_info;
     VkMemoryRequirements memory_requirements;
     VkBindImageMemoryInfo bind_info;
     struct d3d12_resource *object;
-    bool force_committed;
     VkResult vr;
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_validate_heap(desc, heap)))
         return hr;
 
-    /* Placed linear textures are ... problematic
-     * since we have no way of signalling that they have different alignment and size requirements
-     * than optimal textures. GetResourceAllocationInfo() does not take heap property information
-     * and assumes that we are not modifying the tiling mode. */
-    force_committed = desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-            is_cpu_accessible_heap(&heap->desc.Properties);
-
-    if (force_committed || heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
+    if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
     {
-        if (!force_committed)
-            WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
+        WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
 
         if (FAILED(hr = d3d12_resource_create_committed(device, desc, &heap->desc.Properties,
                 heap->desc.Flags & ~(D3D12_HEAP_FLAG_DENY_BUFFERS |
@@ -3015,6 +3018,29 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             hr = E_INVALIDARG;
             goto fail;
         }
+
+        if (object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
+        {
+            /* Packed linear size should never be greater than the image size */
+            assert(vkd3d_compute_resource_layouts_from_desc(device, desc, NULL) <= memory_requirements.size);
+
+            /* Allocate video memory for the actual image resource */
+            memset(&allocate_info, 0, sizeof(allocate_info));
+            allocate_info.memory_requirements = memory_requirements;
+            allocate_info.heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            allocate_info.heap_flags = 0;
+
+            if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+                allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            else
+                allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+
+            if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, &object->private_mem)))
+            {
+                hr = E_OUTOFMEMORY;
+                goto fail;
+            }
+        }
     }
     else
     {
@@ -3034,8 +3060,17 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
         bind_info.pNext = NULL;
         bind_info.image = object->res.vk_image;
-        bind_info.memory = object->mem.device_allocation.vk_memory;
-        bind_info.memoryOffset = object->mem.offset;
+
+        if (object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY)
+        {
+            bind_info.memory = object->private_mem.device_allocation.vk_memory;
+            bind_info.memoryOffset = object->private_mem.offset;
+        }
+        else
+        {
+            bind_info.memory = object->mem.device_allocation.vk_memory;
+            bind_info.memoryOffset = object->mem.offset;
+        }
 
         if ((vr = VK_CALL(vkBindImageMemory2KHR(device->vk_device, 1, &bind_info))) < 0)
         {
@@ -5079,6 +5114,12 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
     sampler_desc.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     sampler_desc.unnormalizedCoordinates = VK_FALSE;
 
+    if (sampler_desc.maxAnisotropy < 1.0f)
+        sampler_desc.anisotropyEnable = VK_FALSE;
+
+    if (sampler_desc.anisotropyEnable)
+        sampler_desc.maxAnisotropy = min(16.0f, sampler_desc.maxAnisotropy);
+
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
         sampler_desc.borderColor = vk_border_color_from_d3d12(device, desc->BorderColor);
 
@@ -6620,9 +6661,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     VkMemoryRequirements2 memory_requirements;
     struct vkd3d_memory_topology topology;
     VkBufferCreateInfo buffer_info;
-    uint32_t sampled_type_mask_cpu;
     VkImageCreateInfo image_info;
-    uint32_t rt_ds_type_mask_cpu;
     uint32_t sampled_type_mask;
     uint32_t host_visible_mask;
     uint32_t buffer_type_mask;
@@ -6697,25 +6736,8 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
     sampled_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
 
-    /* CPU accessible images are always LINEAR.
-     * If we ever get a way to write to OPTIMAL-ly tiled images, we can drop this and just
-     * do sampled_type_mask_cpu & host_visible_set. */
-    image_info.tiling = VK_IMAGE_TILING_LINEAR;
-    image_info.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
-    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-            VK_IMAGE_USAGE_SAMPLED_BIT;
-    /* Deliberately omit STORAGE_BIT here, since it's not supported at all on NV with HOST_VISIBLE.
-     * Probably not 100% correct, but we can fix this if we get host visible OPTIMAL at some point. */
-    sampled_type_mask_cpu = 0;
-    if (vkd3d_is_linear_tiling_supported(device, &image_info))
-    {
-        VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
-        sampled_type_mask_cpu = memory_requirements.memoryRequirements.memoryTypeBits;
-    }
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
     image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -6726,17 +6748,8 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
     rt_ds_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
 
-    image_info.tiling = VK_IMAGE_TILING_LINEAR;
-    image_info.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
-    rt_ds_type_mask_cpu = 0;
-    if (vkd3d_is_linear_tiling_supported(device, &image_info))
-    {
-        VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
-        rt_ds_type_mask_cpu = memory_requirements.memoryRequirements.memoryTypeBits;
-    }
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
     image_info.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -6745,10 +6758,6 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
 
     VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
     rt_ds_type_mask &= memory_requirements.memoryRequirements.memoryTypeBits;
-
-    /* Unsure if we can have host visible depth-stencil.
-     * On AMD, we can get linear RT, but not linear DS, so for now, just don't check for that.
-     * We will fail in resource creation instead. */
 
     info->non_cpu_accessible_domain.buffer_type_mask = buffer_type_mask;
     info->non_cpu_accessible_domain.sampled_type_mask = sampled_type_mask;
@@ -6759,16 +6768,10 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         if (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
             host_visible_mask |= 1u << i;
 
+    /* We don't create images in host-visible memory anymore, only buffers */
     info->cpu_accessible_domain.buffer_type_mask = buffer_type_mask & host_visible_mask;
-    info->cpu_accessible_domain.sampled_type_mask = sampled_type_mask_cpu & host_visible_mask;
-    info->cpu_accessible_domain.rt_ds_type_mask = rt_ds_type_mask_cpu & host_visible_mask;
-
-    /* If we cannot support linear render targets, this is fine.
-     * If we don't fix this up here, we will fail to create a host visible TIER_2 heap.
-     * Ignore any requirements for color attachments since we're never going to use it anyways. */
-    if (info->cpu_accessible_domain.rt_ds_type_mask == 0 ||
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_IGNORE_RTV_HOST_VISIBLE))
-        info->cpu_accessible_domain.rt_ds_type_mask = info->cpu_accessible_domain.sampled_type_mask;
+    info->cpu_accessible_domain.sampled_type_mask = buffer_type_mask & host_visible_mask;
+    info->cpu_accessible_domain.rt_ds_type_mask = buffer_type_mask & host_visible_mask;
 
     TRACE("Device supports buffers on memory types 0x%#x.\n", buffer_type_mask);
     TRACE("Device supports textures on memory types 0x%#x.\n", sampled_type_mask);
