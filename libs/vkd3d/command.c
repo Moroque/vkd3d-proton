@@ -7730,10 +7730,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_RSSetScissorRects(d3d12_command
     for (i = 0; i < rect_count; ++i)
     {
         VkRect2D *vk_rect = &dyn_state->scissors[i];
-        vk_rect->offset.x = rects[i].left;
-        vk_rect->offset.y = rects[i].top;
-        vk_rect->extent.width = rects[i].right - rects[i].left;
-        vk_rect->extent.height = rects[i].bottom - rects[i].top;
+        vk_rect->offset.x = max(rects[i].left, 0);
+        vk_rect->offset.y = max(rects[i].top, 0);
+        vk_rect->extent.width = max(vk_rect->offset.x, rects[i].right) - vk_rect->offset.x;
+        vk_rect->extent.height = max(vk_rect->offset.y, rects[i].bottom) - vk_rect->offset.y;
     }
 
     dyn_state->dirty_flags |= VKD3D_DYNAMIC_STATE_SCISSOR;
@@ -8956,7 +8956,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_SOSetTargets(d3d12_command_list
             list->so_counter_buffers[start_slot + i] = VK_NULL_HANDLE;
             list->so_counter_buffer_offsets[start_slot + i] = 0;
 
-            WARN("Trying to unbind transform feedback buffer %u. Ignoring.\n", start_slot + i);
+            TRACE("Trying to unbind transform feedback buffer %u. Ignoring.\n", start_slot + i);
         }
     }
 
@@ -9017,7 +9017,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
 
         if (!rtv_desc || !rtv_desc->resource)
         {
-            WARN("RTV descriptor %u is not initialized.\n", i);
+            TRACE("RTV descriptor %u is not initialized.\n", i);
             continue;
         }
 
