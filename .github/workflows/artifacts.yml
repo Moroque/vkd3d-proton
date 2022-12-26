@@ -4,7 +4,7 @@ on: [push, pull_request, workflow_dispatch]
 
 jobs:
   build-artifacts:
-    runs-on: windows
+    runs-on: windows-2022
 
     steps:
     - name: Checkout code
