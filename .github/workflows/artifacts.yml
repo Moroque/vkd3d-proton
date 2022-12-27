@@ -3,7 +3,7 @@ name: Artifacts (Package)
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
-  build-artifacts:
+  build-set-windows:
     runs-on: windows-2022
 
     steps:
@@ -13,14 +13,42 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Build release
-      id: build-release
-      uses: Joshua-Ashton/arch-mingw-github-action@v8
-      with:
-        command: |
-          export VERSION_NAME="${GITHUB_REF##*/}-${GITHUB_SHA##*/}"
-          ./package-release.sh ${VERSION_NAME} build --no-package
-          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+    - name: Setup widl and glslangValidator
+      shell: pwsh
+      run: |
+        choco install strawberryperl vulkan-sdk -y
+        Write-Output "C:\Strawberry\c\bin" | Out-File -FilePath "${Env:GITHUB_PATH}" -Append
+        Write-Output "$([System.Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine'))\Bin" `
+          | Out-File -FilePath "${Env:GITHUB_PATH}" -Append
+    - name: Setup Meson
+      shell: pwsh
+      run: pip install meson
+
+    - name: Find Visual Studio
+      shell: pwsh
+      run: |
+        $installationPath = Get-VSSetupInstance `
+          | Select-VSSetupInstance -Require Microsoft.VisualStudio.Workload.NativeDesktop -Latest `
+          | Select-Object -ExpandProperty InstallationPath
+        Write-Output "VSDEVCMD=${installationPath}\Common7\Tools\VsDevCmd.bat" `
+          | Out-File -FilePath "${Env:GITHUB_ENV}" -Append
+    - name: Build MSVC x86
+      shell: pwsh
+      run: |
+        & "${Env:COMSPEC}" /s /c "`"${Env:VSDEVCMD}`" -arch=x86 -host_arch=x64 -no_logo && set" `
+          | % { , ($_ -Split '=', 2) } `
+          | % { [System.Environment]::SetEnvironmentVariable($_[0], $_[1]) }
+        meson setup -Denable_tests=True -Denable_extras=True --buildtype release --backend vs2022 build-msvc-x86
+        msbuild -m build-msvc-x86/vkd3d-proton.sln
+    - name: Build MSVC x64
+      shell: pwsh
+      run: |
+        & "${Env:COMSPEC}" /s /c "`"${Env:VSDEVCMD}`" -arch=x64 -host_arch=x64 -no_logo && set" `
+          | % { , ($_ -Split '=', 2) } `
+          | % { [System.Environment]::SetEnvironmentVariable($_[0], $_[1]) }
+        meson setup -Denable_tests=True -Denable_extras=True --buildtype release --backend vs2022 build-msvc-x64
+        msbuild -m build-msvc-x64/vkd3d-proton.sln
+
 
     - name: Upload artifacts
       id: upload-artifacts
