@@ -55,5 +55,5 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         name: vkd3d-proton-${{ env.VERSION_NAME }}
-        path: build/vkd3d-proton-${{ env.VERSION_NAME }}
+        path: D:\a\vkd3d-proton\vkd3d-proton\build-msvc-x64
         if-no-files-found: error
