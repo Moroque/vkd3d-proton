@@ -11468,6 +11468,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_BuildRaytracingAccelerationStru
     build_info.build_info.scratchData.deviceAddress = desc->ScratchAccelerationStructureData;
 
     d3d12_command_list_end_current_render_pass(list, true);
+    d3d12_command_list_end_transfer_batch(list);
+
     VK_CALL(vkCmdBuildAccelerationStructuresKHR(list->vk_command_buffer, 1,
             &build_info.build_info, build_info.build_range_ptrs));
 
@@ -11520,6 +11522,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyRaytracingAccelerationStruc
     }
 
     d3d12_command_list_end_current_render_pass(list, true);
+    d3d12_command_list_end_transfer_batch(list);
     vkd3d_acceleration_structure_copy(list, dst_data, src_data, mode);
 
     VKD3D_BREADCRUMB_COMMAND(COPY_RTAS);
@@ -11603,6 +11606,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchRays(d3d12_command_list
     miss_table = convert_strided_range(&desc->MissShaderTable);
     hit_table = convert_strided_range(&desc->HitGroupTable);
     callable_table = convert_strided_range(&desc->CallableShaderTable);
+
+    d3d12_command_list_end_transfer_batch(list);
 
     if (!d3d12_command_list_update_raygen_state(list))
     {
@@ -12003,19 +12008,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_QueryInterface(ID3D12Comman
         return S_OK;
     }
 
-#ifdef _WIN32
-    if (IsEqualGUID(riid, &IID_IWineDXGISwapChainFactory))
-    {
-        struct d3d12_command_queue *command_queue = impl_from_ID3D12CommandQueue(iface);
-        IWineDXGISwapChainFactory_AddRef(&command_queue->swapchain_factory.IWineDXGISwapChainFactory_iface);
-        *object = &command_queue->swapchain_factory;
-        INFO("Exposing legacy swapchain interface. Either legacy swapchain was forced, or DXVK < 2.0 is used.\n");
-        return S_OK;
-    }
-#endif
-
-    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SWAPCHAIN_LEGACY) &&
-            IsEqualGUID(riid, &IID_IDXGIVkSwapChainFactory))
+    if (IsEqualGUID(riid, &IID_IDXGIVkSwapChainFactory))
     {
         struct d3d12_command_queue *command_queue = impl_from_ID3D12CommandQueue(iface);
         IDXGIVkSwapChainFactory_AddRef(&command_queue->vk_swap_chain_factory.IDXGIVkSwapChainFactory_iface);
@@ -13701,10 +13694,6 @@ static HRESULT d3d12_command_queue_init(struct d3d12_command_queue *queue,
 
     if (FAILED(hr = dxgi_vk_swap_chain_factory_init(queue, &queue->vk_swap_chain_factory)))
         goto fail_swapchain_factory;
-#ifdef _WIN32
-    if (FAILED(hr = d3d12_swapchain_factory_init(queue, &queue->swapchain_factory)))
-        goto fail_swapchain_factory;
-#endif
 
     d3d12_device_add_ref(queue->device = device);
 

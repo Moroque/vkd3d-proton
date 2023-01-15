@@ -739,7 +739,6 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"host_import_fallback", VKD3D_CONFIG_FLAG_USE_HOST_IMPORT_FALLBACK},
     {"preallocate_srv_mip_clamps", VKD3D_CONFIG_FLAG_PREALLOCATE_SRV_MIP_CLAMPS},
     {"force_initial_transition", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION},
-    {"swapchain_legacy", VKD3D_CONFIG_FLAG_SWAPCHAIN_LEGACY},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -4092,6 +4091,87 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             return S_OK;
         }
 
+        case D3D12_FEATURE_D3D12_OPTIONS12:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            data->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_UNKNOWN;
+            data->EnhancedBarriersSupported = FALSE;
+            data->RelaxedFormatCastingSupported = FALSE;
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS13:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS13 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            data->UnrestrictedBufferTextureCopyPitchSupported = FALSE;
+            data->UnrestrictedVertexElementAlignmentSupported = FALSE;
+            data->InvertedViewportHeightFlipsYSupported = FALSE;
+            data->InvertedViewportDepthFlipsZSupported = FALSE;
+            data->TextureCopyBetweenDimensionsSupported = FALSE;
+            data->AlphaBlendFactorSupported = FALSE;
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS14:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS14 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            data->AdvancedTextureOpsSupported = FALSE;
+            data->WriteableMSAATexturesSupported = FALSE;
+            data->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS15:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS15 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            data->TriangleFanSupported = FALSE;
+            data->DynamicIndexBufferStripCutSupported = FALSE;
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS16:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS16 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            data->DynamicDepthBiasSupported = FALSE;
+            data->Reserved = FALSE;
+            return S_OK;
+        }
+
         case D3D12_FEATURE_QUERY_META_COMMAND:
         {
             D3D12_FEATURE_DATA_QUERY_META_COMMAND *data = feature_data;
@@ -5393,9 +5473,13 @@ static void STDMETHODCALLTYPE d3d12_device_RemoveDevice(d3d12_device_iface *ifac
 static HRESULT STDMETHODCALLTYPE d3d12_device_EnumerateMetaCommands(d3d12_device_iface *iface,
         UINT *count, D3D12_META_COMMAND_DESC *descs)
 {
-    FIXME("iface %p, count %p, descs %p stub!\n", iface, count, descs);
+    TRACE("iface %p, count %p, descs %p.\n", iface, count, descs);
 
-    return E_NOTIMPL;
+    if (!count)
+        return E_INVALIDARG;
+
+    *count = 0;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_EnumerateMetaCommandParameters(d3d12_device_iface *iface,
