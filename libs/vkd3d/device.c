@@ -399,38 +399,10 @@ static HRESULT vkd3d_init_instance_caps(struct vkd3d_instance *instance,
 static HRESULT vkd3d_init_vk_global_procs(struct vkd3d_instance *instance,
         PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr)
 {
-    HRESULT hr;
-
     if (!vkGetInstanceProcAddr)
-    {
-        if (!(instance->libvulkan = vkd3d_dlopen(SONAME_LIBVULKAN)))
-        {
-            ERR("Failed to load libvulkan: %s.\n", vkd3d_dlerror());
-            return E_FAIL;
-        }
+        return E_INVALIDARG;
 
-        if (!(vkGetInstanceProcAddr = vkd3d_dlsym(instance->libvulkan, "vkGetInstanceProcAddr")))
-        {
-            ERR("Could not load function pointer for vkGetInstanceProcAddr().\n");
-            vkd3d_dlclose(instance->libvulkan);
-            instance->libvulkan = NULL;
-            return E_FAIL;
-        }
-    }
-    else
-    {
-        instance->libvulkan = NULL;
-    }
-
-    if (FAILED(hr = vkd3d_load_vk_global_procs(&instance->vk_global_procs, vkGetInstanceProcAddr)))
-    {
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
-        instance->libvulkan = NULL;
-        return hr;
-    }
-
-    return S_OK;
+    return vkd3d_load_vk_global_procs(&instance->vk_global_procs, vkGetInstanceProcAddr);
 }
 
 static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
@@ -814,8 +786,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
     if (FAILED(hr = vkd3d_init_instance_caps(instance, create_info,
             &extension_count, user_extension_supported)))
     {
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
         vkd3d_free(user_extension_supported);
         return hr;
     }
@@ -828,8 +798,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
         ERR("Vulkan %u.%u not supported by loader.\n",
                 VK_VERSION_MAJOR(VKD3D_MIN_API_VERSION),
                 VK_VERSION_MINOR(VKD3D_MIN_API_VERSION));
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
         vkd3d_free(user_extension_supported);
         return E_INVALIDARG;
     }
@@ -855,8 +823,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
 
     if (!(extensions = vkd3d_calloc(extension_count, sizeof(*extensions))))
     {
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
         vkd3d_free(user_extension_supported);
         return E_OUTOFMEMORY;
     }
@@ -910,8 +876,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
     if (vr < 0)
     {
         ERR("Failed to create Vulkan instance, vr %d.\n", vr);
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
         return hresult_from_vk_result(vr);
     }
 
@@ -920,8 +884,6 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
         ERR("Failed to load instance procs, hr %#x.\n", hr);
         if (instance->vk_procs.vkDestroyInstance)
             instance->vk_procs.vkDestroyInstance(vk_instance, NULL);
-        if (instance->libvulkan)
-            vkd3d_dlclose(instance->libvulkan);
         return hr;
     }
 
@@ -950,33 +912,54 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
     return S_OK;
 }
 
+static struct vkd3d_instance *instance_singleton;
+static pthread_mutex_t instance_singleton_lock = PTHREAD_MUTEX_INITIALIZER;
+
 HRESULT vkd3d_create_instance(const struct vkd3d_instance_create_info *create_info,
         struct vkd3d_instance **instance)
 {
     struct vkd3d_instance *object;
-    HRESULT hr;
+    HRESULT hr = S_OK;
+
+    /* As long as there are live ID3D12Devices, we should only have one VkInstance that all devices can share. */
+    pthread_mutex_lock(&instance_singleton_lock);
+    if (instance_singleton)
+    {
+        vkd3d_instance_incref(*instance = instance_singleton);
+        TRACE("Handling out global instance singleton.\n");
+        goto out_unlock;
+    }
 
     TRACE("create_info %p, instance %p.\n", create_info, instance);
 
     vkd3d_init_profiling();
 
     if (!create_info || !instance)
-        return E_INVALIDARG;
+    {
+        hr = E_INVALIDARG;
+        goto out_unlock;
+    }
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
-        return E_OUTOFMEMORY;
+    {
+        hr = E_OUTOFMEMORY;
+        goto out_unlock;
+    }
 
     if (FAILED(hr = vkd3d_instance_init(object, create_info)))
     {
         vkd3d_free(object);
-        return hr;
+        goto out_unlock;
     }
 
     TRACE("Created instance %p.\n", object);
 
     *instance = object;
+    instance_singleton = object;
 
-    return S_OK;
+out_unlock:
+    pthread_mutex_unlock(&instance_singleton_lock);
+    return hr;
 }
 
 static void vkd3d_destroy_instance(struct vkd3d_instance *instance)
@@ -988,9 +971,6 @@ static void vkd3d_destroy_instance(struct vkd3d_instance *instance)
         VK_CALL(vkDestroyDebugUtilsMessengerEXT(vk_instance, instance->vk_debug_callback, NULL));
 
     VK_CALL(vkDestroyInstance(vk_instance, NULL));
-
-    if (instance->libvulkan)
-        vkd3d_dlclose(instance->libvulkan);
 
     vkd3d_free(instance);
 }
@@ -1006,13 +986,24 @@ ULONG vkd3d_instance_incref(struct vkd3d_instance *instance)
 
 ULONG vkd3d_instance_decref(struct vkd3d_instance *instance)
 {
-    ULONG refcount = InterlockedDecrement(&instance->refcount);
+    ULONG refcount;
+
+    /* The device singleton is more advanced, since it uses a CAS loop.
+     * Device references are lowered constantly, but instance references only release
+     * when the ID3D12Device itself dies, which should be fairly rare, so we should use simpler code. */
+    pthread_mutex_lock(&instance_singleton_lock);
+    refcount = InterlockedDecrement(&instance->refcount);
 
     TRACE("%p decreasing refcount to %u.\n", instance, refcount);
 
     if (!refcount)
+    {
+        assert(instance_singleton == instance);
         vkd3d_destroy_instance(instance);
+        instance_singleton = NULL;
+    }
 
+    pthread_mutex_unlock(&instance_singleton_lock);
     return refcount;
 }
 
