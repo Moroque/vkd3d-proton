@@ -376,6 +376,11 @@ static bool vkd3d_sparse_image_may_have_mip_tail(const D3D12_RESOURCE_DESC1 *des
 static bool vkd3d_resource_can_be_vrs(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, const D3D12_RESOURCE_DESC1 *desc)
 {
+    /* Docs say that RTV should not be allowed for fragment shading rate images, yet it works on native,
+     * Dead Space 2023 relies on it, and D3D12 debug layers don't complain.
+     * Technically, it does not seem to care about SIMULTANEOUS_ACCESS either,
+     * but we only workaround when it's proven to be required.
+     * It would complicate things since it affects layouts, etc. */
     return device->device_info.fragment_shading_rate_features.attachmentFragmentShadingRate &&
             desc->Format == DXGI_FORMAT_R8_UINT &&
             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
@@ -385,8 +390,7 @@ static bool vkd3d_resource_can_be_vrs(struct d3d12_device *device,
             desc->Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
             heap_properties &&
             !is_cpu_accessible_heap(heap_properties) &&
-            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                 D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                 D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
                 D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY));
@@ -777,6 +781,16 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
 
     allocation_info->SizeInBytes = requirements.memoryRequirements.size;
     allocation_info->Alignment = requirements.memoryRequirements.alignment;
+
+    /* If we might create an image with VRS usage, need to also check memory requirements without VRS usage.
+     * VRS usage can depend on heap properties and this can affect compression, tile layouts, etc. */
+    if (create_info.image_info.usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+    {
+        create_info.image_info.usage &= ~VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &requirement_info, &requirements));
+        allocation_info->SizeInBytes = max(requirements.memoryRequirements.size, allocation_info->SizeInBytes);
+        allocation_info->Alignment = max(requirements.memoryRequirements.alignment, allocation_info->Alignment);
+    }
 
     /* Do not report alignments greater than DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
      * since that might confuse apps. Instead, pad the allocation so that we can
@@ -2594,6 +2608,8 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
         VK_CALL(vkDestroyImageView(device->vk_device, resource->vrs_view, NULL));
 
     vkd3d_private_store_destroy(&resource->private_store);
+    if (resource->heap)
+        d3d12_heap_decref(resource->heap);
     vkd3d_free(resource);
 }
 
@@ -3000,7 +3016,9 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             &heap->desc.Properties, heap->desc.Flags, initial_state, optimized_clear_value, &object)))
         return hr;
 
-    object->heap = heap;
+    /* https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap#remarks.
+     * Placed resources hold a reference on the heap. */
+    d3d12_heap_incref(object->heap = heap);
 
     if (d3d12_resource_is_texture(object))
     {
