@@ -174,6 +174,7 @@ struct vkd3d_vulkan_info
     bool EXT_pipeline_creation_cache_control;
     bool EXT_shader_module_identifier;
     bool EXT_descriptor_buffer;
+    bool EXT_pipeline_library_group_handles;
     /* AMD device extensions */
     bool AMD_buffer_marker;
     bool AMD_device_coherent_memory;
@@ -2657,6 +2658,12 @@ struct d3d12_command_queue_submission_execute
     struct vkd3d_initial_transition *transitions;
     size_t transition_count;
 
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    /* Replays commands in submission order for heavy debug. */
+    unsigned int *breadcrumb_indices;
+    size_t breadcrumb_indices_count;
+#endif
+
     bool debug_capture;
 };
 
@@ -2888,6 +2895,7 @@ enum vkd3d_breadcrumb_command_type
     VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT,
     VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_TEMPLATE,
     VKD3D_BREADCRUMB_COMMAND_COPY,
+    VKD3D_BREADCRUMB_COMMAND_COPY_TILES,
     VKD3D_BREADCRUMB_COMMAND_RESOLVE,
     VKD3D_BREADCRUMB_COMMAND_WBI,
     VKD3D_BREADCRUMB_COMMAND_RESOLVE_QUERY,
@@ -2904,6 +2912,9 @@ enum vkd3d_breadcrumb_command_type
     VKD3D_BREADCRUMB_COMMAND_ROOT_DESC,
     VKD3D_BREADCRUMB_COMMAND_ROOT_CONST,
     VKD3D_BREADCRUMB_COMMAND_TAG,
+    VKD3D_BREADCRUMB_COMMAND_DISCARD,
+    VKD3D_BREADCRUMB_COMMAND_CLEAR_INLINE,
+    VKD3D_BREADCRUMB_COMMAND_CLEAR_PASS,
 };
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -2976,6 +2987,16 @@ void vkd3d_breadcrumb_tracer_add_command(struct d3d12_command_list *list,
 void vkd3d_breadcrumb_tracer_signal(struct d3d12_command_list *list);
 void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list);
 
+#define VKD3D_BREADCRUMB_FLUSH_BATCHES(list) do { \
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+        d3d12_command_list_end_transfer_batch(list);          \
+    } \
+} while(0)
+
+/* For heavy debug, replays the trace stream in submission order. */
+void vkd3d_breadcrumb_tracer_dump_command_list(struct vkd3d_breadcrumb_tracer *tracer,
+        unsigned int index);
+
 #define VKD3D_BREADCRUMB_COMMAND(cmd_type) do { \
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
         struct vkd3d_breadcrumb_command breadcrumb_cmd; \
@@ -3012,6 +3033,15 @@ void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list);
     } \
 } while(0)
 
+#define VKD3D_BREADCRUMB_TAG(tag_static_str) do { \
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
+        struct vkd3d_breadcrumb_command breadcrumb_cmd; \
+        breadcrumb_cmd.type = VKD3D_BREADCRUMB_COMMAND_TAG; \
+        breadcrumb_cmd.tag = tag_static_str; \
+        vkd3d_breadcrumb_tracer_add_command(list, &breadcrumb_cmd); \
+    } \
+} while(0)
+
 /* Remember to kick debug ring as well. */
 #define VKD3D_DEVICE_REPORT_BREADCRUMB_IF(device, cond) do { \
     if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) && (cond)) { \
@@ -3019,12 +3049,111 @@ void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list);
         vkd3d_shader_debug_ring_kick(&(device)->debug_ring, device, true); \
     } \
 } while(0)
+
+static inline void vkd3d_breadcrumb_image(
+        struct d3d12_command_list *list, const struct d3d12_resource *resource)
+{
+    const D3D12_RESOURCE_DESC1 *desc = &resource->desc;
+    VKD3D_BREADCRUMB_TAG("ImageDesc [Cookie, DXGI_FORMAT, D3D12_RESOURCE_DIMENSION, width, height, DepthOrArraySize, MipLevels, Flags]");
+    VKD3D_BREADCRUMB_AUX64(resource->res.cookie);
+    VKD3D_BREADCRUMB_AUX32(desc->Format);
+    VKD3D_BREADCRUMB_AUX32(desc->Dimension);
+    VKD3D_BREADCRUMB_AUX64(desc->Width);
+    VKD3D_BREADCRUMB_AUX32(desc->Height);
+    VKD3D_BREADCRUMB_AUX32(desc->DepthOrArraySize);
+    VKD3D_BREADCRUMB_AUX32(desc->MipLevels);
+    VKD3D_BREADCRUMB_AUX32(desc->Flags);
+}
+
+static inline void vkd3d_breadcrumb_buffer(
+        struct d3d12_command_list *list, const struct d3d12_resource *resource)
+{
+    VKD3D_BREADCRUMB_TAG("BufferDesc [VkBuffer VA, SuballocatedOffset, Cookie, GlobalCookie, Size, Flags]");
+    VKD3D_BREADCRUMB_AUX64(resource->mem.resource.va);
+    VKD3D_BREADCRUMB_AUX64(resource->mem.offset);
+    VKD3D_BREADCRUMB_AUX64(resource->res.cookie);
+    VKD3D_BREADCRUMB_AUX64(resource->mem.resource.cookie);
+    VKD3D_BREADCRUMB_AUX64(resource->desc.Width);
+    VKD3D_BREADCRUMB_AUX32(resource->desc.Flags);
+}
+
+static inline void vkd3d_breadcrumb_resource(
+        struct d3d12_command_list *list, const struct d3d12_resource *resource)
+{
+    if (d3d12_resource_is_buffer(resource))
+        vkd3d_breadcrumb_buffer(list, resource);
+    else if (d3d12_resource_is_texture(resource))
+        vkd3d_breadcrumb_image(list, resource);
+}
+
+static inline void vkd3d_breadcrumb_subresource(
+        struct d3d12_command_list *list, const VkImageSubresourceLayers *subresource)
+{
+    VKD3D_BREADCRUMB_TAG("SubresourceLayers [mipLevel, baseArrayLayer, layerCount, aspectMask]");
+    VKD3D_BREADCRUMB_AUX32(subresource->mipLevel);
+    VKD3D_BREADCRUMB_AUX32(subresource->baseArrayLayer);
+    VKD3D_BREADCRUMB_AUX32(subresource->layerCount);
+    VKD3D_BREADCRUMB_AUX32(subresource->aspectMask);
+}
+
+static inline void vkd3d_breadcrumb_buffer_image_copy(
+        struct d3d12_command_list *list, const VkBufferImageCopy2 *buffer_image)
+{
+    vkd3d_breadcrumb_subresource(list, &buffer_image->imageSubresource);
+    VKD3D_BREADCRUMB_TAG("ImageOffsetExtent [offset, extent, bufferOffset, bufferRowLength, bufferImageHeight]");
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageOffset.x);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageOffset.y);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageOffset.z);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageExtent.width);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageExtent.height);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->imageExtent.depth);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->bufferOffset);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->bufferRowLength);
+    VKD3D_BREADCRUMB_AUX32(buffer_image->bufferImageHeight);
+}
+
+static inline void vkd3d_breadcrumb_image_copy(
+        struct d3d12_command_list *list, const VkImageCopy2 *image)
+{
+    vkd3d_breadcrumb_subresource(list, &image->srcSubresource);
+    vkd3d_breadcrumb_subresource(list, &image->dstSubresource);
+    VKD3D_BREADCRUMB_TAG("ImageOffsetExtent [srcOffset, dstOffset, extent]");
+    VKD3D_BREADCRUMB_AUX32(image->srcOffset.x);
+    VKD3D_BREADCRUMB_AUX32(image->srcOffset.y);
+    VKD3D_BREADCRUMB_AUX32(image->srcOffset.z);
+    VKD3D_BREADCRUMB_AUX32(image->dstOffset.x);
+    VKD3D_BREADCRUMB_AUX32(image->dstOffset.y);
+    VKD3D_BREADCRUMB_AUX32(image->dstOffset.z);
+    VKD3D_BREADCRUMB_AUX32(image->extent.width);
+    VKD3D_BREADCRUMB_AUX32(image->extent.height);
+    VKD3D_BREADCRUMB_AUX32(image->extent.depth);
+}
+
+static inline void vkd3d_breadcrumb_buffer_copy(
+        struct d3d12_command_list *list, const VkBufferCopy2 *buffer)
+{
+    VKD3D_BREADCRUMB_TAG("BufferCopy [srcOffset, dstOffset, size]");
+    VKD3D_BREADCRUMB_AUX64(buffer->srcOffset);
+    VKD3D_BREADCRUMB_AUX64(buffer->dstOffset);
+    VKD3D_BREADCRUMB_AUX64(buffer->size);
+}
+
+#define VKD3D_BREADCRUMB_RESOURCE(res) vkd3d_breadcrumb_resource(list, res)
+#define VKD3D_BREADCRUMB_BUFFER_IMAGE_COPY(buffer_image) vkd3d_breadcrumb_buffer_image_copy(list, buffer_image)
+#define VKD3D_BREADCRUMB_IMAGE_COPY(image) vkd3d_breadcrumb_image_copy(list, image)
+#define VKD3D_BREADCRUMB_BUFFER_COPY(buffer) vkd3d_breadcrumb_buffer_copy(list, buffer)
 #else
 #define VKD3D_BREADCRUMB_COMMAND(type) ((void)(VKD3D_BREADCRUMB_COMMAND_##type))
 #define VKD3D_BREADCRUMB_COMMAND_STATE(type) ((void)(VKD3D_BREADCRUMB_COMMAND_##type))
 #define VKD3D_BREADCRUMB_AUX32(v) ((void)(v))
 #define VKD3D_BREADCRUMB_AUX64(v) ((void)(v))
 #define VKD3D_DEVICE_REPORT_BREADCRUMB_IF(device, cond) ((void)(device), (void)(cond))
+#define VKD3D_BREADCRUMB_FLUSH_BATCHES(list) ((void)(list))
+#define VKD3D_BREADCRUMB_TAG(tag) ((void)(tag))
+#define VKD3D_BREADCRUMB_RESOURCE(res) ((void)(res))
+#define VKD3D_BREADCRUMB_BUFFER_IMAGE_COPY(buffer_image) ((void)(buffer_image))
+#define VKD3D_BREADCRUMB_IMAGE_COPY(image) ((void)(image))
+#define VKD3D_BREADCRUMB_BUFFER_COPY(buffer) ((void)(buffer))
 #endif /* VKD3D_ENABLE_BREADCRUMBS */
 
 /* Bindless */
@@ -3575,6 +3704,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDevicePresentIdFeaturesKHR present_id_features;
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer_features;
+    VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT pipeline_library_group_handles_features;
 
     VkPhysicalDeviceFeatures2 features2;
 

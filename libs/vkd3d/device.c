@@ -40,7 +40,7 @@ struct vkd3d_optional_extension_info
 {
     const char *extension_name;
     ptrdiff_t vulkan_info_offset;
-    uint64_t required_config_flags;
+    uint64_t enable_config_flags;
 };
 
 #define VK_EXTENSION(name, member) \
@@ -127,6 +127,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(EXT_PIPELINE_CREATION_CACHE_CONTROL, EXT_pipeline_creation_cache_control),
     VK_EXTENSION(EXT_SHADER_MODULE_IDENTIFIER, EXT_shader_module_identifier),
     VK_EXTENSION(EXT_DESCRIPTOR_BUFFER, EXT_descriptor_buffer),
+    VK_EXTENSION_COND(EXT_PIPELINE_LIBRARY_GROUP_HANDLES, EXT_pipeline_library_group_handles, VKD3D_CONFIG_FLAG_DXR),
     /* AMD extensions */
     VK_EXTENSION(AMD_BUFFER_MARKER, AMD_buffer_marker),
     VK_EXTENSION(AMD_DEVICE_COHERENT_MEMORY, AMD_device_coherent_memory),
@@ -138,7 +139,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(NVX_IMAGE_VIEW_HANDLE, NVX_image_view_handle),
     VK_EXTENSION(NV_FRAGMENT_SHADER_BARYCENTRIC, NV_fragment_shader_barycentric),
     VK_EXTENSION(NV_COMPUTE_SHADER_DERIVATIVES, NV_compute_shader_derivatives),
-    VK_EXTENSION_COND(NV_DEVICE_DIAGNOSTIC_CHECKPOINTS, NV_device_diagnostic_checkpoints, VKD3D_CONFIG_FLAG_BREADCRUMBS),
+    VK_EXTENSION_COND(NV_DEVICE_DIAGNOSTIC_CHECKPOINTS, NV_device_diagnostic_checkpoints, VKD3D_CONFIG_FLAG_BREADCRUMBS | VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE),
     VK_EXTENSION(NV_DEVICE_GENERATED_COMMANDS, NV_device_generated_commands),
     /* VALVE extensions */
     VK_EXTENSION(VALVE_MUTABLE_DESCRIPTOR_TYPE, VALVE_mutable_descriptor_type),
@@ -207,12 +208,11 @@ static unsigned int vkd3d_check_extensions(const VkExtensionProperties *extensio
     for (i = 0; i < optional_extension_count; ++i)
     {
         const char *extension_name = optional_extensions[i].extension_name;
-        uint64_t required_flags = optional_extensions[i].required_config_flags;
-        bool has_required_flags = (vkd3d_config_flags & required_flags) == required_flags;
+        uint64_t enable_flags = optional_extensions[i].enable_config_flags;
         ptrdiff_t offset = optional_extensions[i].vulkan_info_offset;
         bool *supported = (void *)((uintptr_t)vulkan_info + offset);
 
-        if (!has_required_flags)
+        if (enable_flags && !(vkd3d_config_flags & enable_flags))
             continue;
 
         if ((*supported = has_extension(extensions, count, extension_name)))
@@ -537,6 +537,8 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Spider-Man.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
     /* Marvel’s Spider-Man: Miles Morales (1817190) */
     { VKD3D_STRING_COMPARE_EXACT, "MilesMorales.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
+    /* Dead Space (2023) (1693980) */
+    { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_FORCE_DEDICATED_IMAGE_ALLOCATION, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -711,6 +713,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"host_import_fallback", VKD3D_CONFIG_FLAG_USE_HOST_IMPORT_FALLBACK},
     {"preallocate_srv_mip_clamps", VKD3D_CONFIG_FLAG_PREALLOCATE_SRV_MIP_CLAMPS},
     {"force_initial_transition", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION},
+    {"breadcrumbs_trace", VKD3D_CONFIG_FLAG_BREADCRUMBS | VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -1588,6 +1591,13 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         vk_prepend_struct(&info->features2, &info->descriptor_buffer_features);
         vk_prepend_struct(&info->properties2, &info->descriptor_buffer_properties);
+    }
+
+    if (vulkan_info->EXT_pipeline_library_group_handles)
+    {
+        info->pipeline_library_group_handles_features.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT;
+        vk_prepend_struct(&info->features2, &info->pipeline_library_group_handles_features);
     }
 
     /* Core in Vulkan 1.1. */

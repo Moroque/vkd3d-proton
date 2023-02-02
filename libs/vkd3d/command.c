@@ -2768,6 +2768,11 @@ static void d3d12_command_list_clear_attachment_inline(struct d3d12_command_list
                     1, &vk_clear_attachment, 1, &vk_clear_rect));
         }
     }
+
+    VKD3D_BREADCRUMB_TAG("clear-view-cookie");
+    VKD3D_BREADCRUMB_AUX64(view->cookie);
+    VKD3D_BREADCRUMB_RESOURCE(resource);
+    VKD3D_BREADCRUMB_COMMAND(CLEAR_INLINE);
 }
 
 static void d3d12_command_list_resolve_buffer_copy_writes(struct d3d12_command_list *list)
@@ -3353,6 +3358,7 @@ static void d3d12_command_list_clear_attachment_pass(struct d3d12_command_list *
 
     if (image_barrier_count)
     {
+        VKD3D_BREADCRUMB_TAG("clear-barrier");
         VK_CALL(vkCmdPipelineBarrier(list->vk_command_buffer,
             stages, stages, 0, 0, NULL, 0, NULL,
             image_barrier_count, image_barriers));
@@ -3367,6 +3373,11 @@ static void d3d12_command_list_clear_attachment_pass(struct d3d12_command_list *
     }
 
     VK_CALL(vkCmdEndRenderingKHR(list->vk_command_buffer));
+
+    VKD3D_BREADCRUMB_TAG("clear-view-cookie");
+    VKD3D_BREADCRUMB_AUX64(view->cookie);
+    VKD3D_BREADCRUMB_RESOURCE(resource);
+    VKD3D_BREADCRUMB_COMMAND(CLEAR_PASS);
 }
 
 static VkPipelineStageFlags vk_queue_shader_stages(struct d3d12_device *device, VkQueueFlags vk_queue_flags)
@@ -6389,6 +6400,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
     copy_info.regionCount = 1;
     copy_info.pRegions = &buffer_copy;
 
+    VKD3D_BREADCRUMB_TAG("Buffer -> Buffer");
+    VKD3D_BREADCRUMB_RESOURCE(src_resource);
+    VKD3D_BREADCRUMB_RESOURCE(dst_resource);
+    VKD3D_BREADCRUMB_BUFFER_COPY(&buffer_copy);
+
     d3d12_command_list_mark_copy_buffer_write(list, copy_info.dstBuffer, buffer_copy.dstOffset, buffer_copy.size,
             !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
     VK_CALL(vkCmdCopyBuffer2KHR(list->vk_command_buffer, &copy_info));
@@ -6667,6 +6683,11 @@ static void d3d12_command_list_copy_image(struct d3d12_command_list *list,
             0, 0, NULL, 0, NULL, overlapping_subresource ? 1 : ARRAY_SIZE(vk_image_barriers),
             vk_image_barriers));
 
+    VKD3D_BREADCRUMB_TAG("Image -> Image");
+    VKD3D_BREADCRUMB_RESOURCE(src_resource);
+    VKD3D_BREADCRUMB_RESOURCE(dst_resource);
+    VKD3D_BREADCRUMB_IMAGE_COPY(region);
+
     if (use_copy)
     {
         copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2_KHR;
@@ -6682,6 +6703,8 @@ static void d3d12_command_list_copy_image(struct d3d12_command_list *list,
     }
     else
     {
+        VKD3D_BREADCRUMB_TAG("CopyWithRenderpass");
+
         dst_view = src_view = NULL;
 
         if (!(dst_format = vkd3d_meta_get_copy_image_attachment_format(&list->device->meta_ops, dst_format, src_format,
@@ -7081,6 +7104,11 @@ static void d3d12_command_list_copy_texture_region(struct d3d12_command_list *li
         copy_info.regionCount = 1;
         copy_info.pRegions = &info->copy.buffer_image;
 
+        VKD3D_BREADCRUMB_TAG("Image -> Buffer");
+        VKD3D_BREADCRUMB_RESOURCE(src_resource);
+        VKD3D_BREADCRUMB_RESOURCE(dst_resource);
+        VKD3D_BREADCRUMB_BUFFER_IMAGE_COPY(&info->copy.buffer_image);
+
         VK_CALL(vkCmdCopyImageToBuffer2KHR(list->vk_command_buffer, &copy_info));
 
         d3d12_command_list_transition_image_layout_with_global_memory_barrier(list, batch, src_resource->res.vk_image,
@@ -7099,6 +7127,11 @@ static void d3d12_command_list_copy_texture_region(struct d3d12_command_list *li
         copy_info.dstImageLayout = info->dst_layout;
         copy_info.regionCount = 1;
         copy_info.pRegions = &info->copy.buffer_image;
+
+        VKD3D_BREADCRUMB_TAG("Buffer -> Image");
+        VKD3D_BREADCRUMB_RESOURCE(src_resource);
+        VKD3D_BREADCRUMB_RESOURCE(dst_resource);
+        VKD3D_BREADCRUMB_BUFFER_IMAGE_COPY(&info->copy.buffer_image);
 
         VK_CALL(vkCmdCopyBufferToImage2KHR(list->vk_command_buffer, &copy_info));
 
@@ -7184,6 +7217,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
 
     list->transfer_batch.batch[list->transfer_batch.batch_len++] = copy_info;
 
+    VKD3D_BREADCRUMB_FLUSH_BATCHES(list);
     VKD3D_BREADCRUMB_COMMAND(COPY);
 }
 
@@ -7229,6 +7263,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
         copy_info.dstBuffer = dst_resource->res.vk_buffer;
         copy_info.regionCount = 1;
         copy_info.pRegions = &vk_buffer_copy;
+
+        VKD3D_BREADCRUMB_TAG("Buffer -> Buffer");
+        VKD3D_BREADCRUMB_RESOURCE(src_resource);
+        VKD3D_BREADCRUMB_RESOURCE(dst_resource);
+        VKD3D_BREADCRUMB_BUFFER_COPY(&vk_buffer_copy);
 
         d3d12_command_list_mark_copy_buffer_write(list, copy_info.dstBuffer, vk_buffer_copy.dstOffset, vk_buffer_copy.size,
                 !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
@@ -7481,6 +7520,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTiles(d3d12_command_list_if
                 !!((copy_to_buffer ? linear_res : tiled_res)->flags & VKD3D_RESOURCE_RESERVED));
         VK_CALL(vkCmdCopyBuffer2KHR(list->vk_command_buffer, &copy_info));
     }
+
+    VKD3D_BREADCRUMB_COMMAND(COPY_TILES);
 }
 
 static void d3d12_command_list_resolve_subresource(struct d3d12_command_list *list,
@@ -8147,6 +8188,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                     continue;
                 }
 
+                VKD3D_BREADCRUMB_AUX64(preserve_resource ? preserve_resource->res.cookie : 0);
+                VKD3D_BREADCRUMB_AUX32(transition->Subresource);
+                VKD3D_BREADCRUMB_AUX32(transition->StateBefore);
+                VKD3D_BREADCRUMB_AUX32(transition->StateAfter);
+                VKD3D_BREADCRUMB_TAG("Resource Transition");
+
                 /* If the resource is a host-visible image and has been used as a UAV, schedule a
                  * subresource update since we cannot know when it is being written in a shader. */
                 if (transition->StateBefore == D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
@@ -8245,6 +8292,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 
                 preserve_resource = impl_from_ID3D12Resource(uav->pResource);
 
+                VKD3D_BREADCRUMB_AUX64(preserve_resource ? preserve_resource->res.cookie : 0);
+                VKD3D_BREADCRUMB_TAG("UAV Barrier");
+
                 /* The only way to synchronize an RTAS is UAV barriers,
                  * as their resource state must be frozen.
                  * If we don't know the resource, we must assume a global UAV transition
@@ -8279,6 +8329,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                 TRACE("Aliasing barrier (before %p, after %p).\n", alias->pResourceBefore, alias->pResourceAfter);
                 before = impl_from_ID3D12Resource(alias->pResourceBefore);
                 after = impl_from_ID3D12Resource(alias->pResourceAfter);
+
+                VKD3D_BREADCRUMB_TAG("Aliasing Barrier");
 
                 if (d3d12_resource_may_alias_other_resources(before) && d3d12_resource_may_alias_other_resources(after))
                 {
@@ -9014,8 +9066,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
         if (!rtv_desc || !rtv_desc->resource)
         {
             TRACE("RTV descriptor %u is not initialized.\n", i);
+            VKD3D_BREADCRUMB_AUX32(i);
+            VKD3D_BREADCRUMB_TAG("RTV bind NULL");
             continue;
         }
+
+        VKD3D_BREADCRUMB_AUX64(rtv_desc->view->cookie);
+        VKD3D_BREADCRUMB_AUX32(i);
+        VKD3D_BREADCRUMB_TAG("RTV bind");
 
         list->rtvs[i] = *rtv_desc;
         list->fb_width = min(list->fb_width, rtv_desc->width);
@@ -9033,10 +9091,13 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
             list->fb_height = min(list->fb_height, rtv_desc->height);
             list->fb_layer_count = min(list->fb_layer_count, rtv_desc->layer_count);
             next_dsv_format = rtv_desc->format->vk_format;
+
+            VKD3D_BREADCRUMB_AUX64(rtv_desc->view->cookie);
+            VKD3D_BREADCRUMB_TAG("DSV bind");
         }
         else
         {
-            WARN("DSV descriptor is not initialized.\n");
+            VKD3D_BREADCRUMB_TAG("DSV bind NULL");
         }
     }
 
@@ -9933,12 +9994,18 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
     if (list->type != D3D12_COMMAND_LIST_TYPE_DIRECT && list->type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
     {
         WARN("Not supported for queue type %d.\n", list->type);
+        VKD3D_BREADCRUMB_RESOURCE(texture);
+        VKD3D_BREADCRUMB_TAG("discard-drop-list-type");
         return;
     }
 
     /* Ignore buffers */
     if (!d3d12_resource_is_texture(texture))
+    {
+        VKD3D_BREADCRUMB_RESOURCE(texture);
+        VKD3D_BREADCRUMB_TAG("discard-drop-resource-type");
         return;
+    }
 
     /* D3D12 requires that the texture is either in render target
      * state, in depth-stencil state, or in UAV state depending on usage flags.
@@ -9949,6 +10016,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
     {
         WARN("Not supported for resource %p.\n", resource);
+        VKD3D_BREADCRUMB_RESOURCE(texture);
+        VKD3D_BREADCRUMB_TAG("discard-drop-usage-flags");
         return;
     }
 
@@ -9987,7 +10056,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
     }
 
     if (!full_discard)
+    {
+        VKD3D_BREADCRUMB_RESOURCE(texture);
+        VKD3D_BREADCRUMB_TAG("discard-drop-incomplete");
         return;
+    }
 
     /* Resource tracking. If we do a full discard, there is no need to do initial layout transitions.
      * Partial discards on first resource use needs to be handles however,
@@ -10015,6 +10088,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
 
     d3d12_command_list_end_current_render_pass(list, !has_unbound_subresource);
 
+    VKD3D_BREADCRUMB_RESOURCE(texture);
+
     if (all_subresource_full_discard)
     {
         vk_subresource_range.baseMipLevel = 0;
@@ -10025,6 +10100,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
 
         d3d12_command_list_discard_attachment_barrier(list,
                 texture, &vk_subresource_range, !has_unbound_subresource);
+        VKD3D_BREADCRUMB_AUX32(~0u);
+        VKD3D_BREADCRUMB_COMMAND(DISCARD);
     }
     else
     {
@@ -10035,6 +10112,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
 
             d3d12_command_list_discard_attachment_barrier(list,
                     texture, &vk_subresource_range, !has_unbound_subresource);
+            VKD3D_BREADCRUMB_AUX32(i);
+            VKD3D_BREADCRUMB_COMMAND(DISCARD);
         }
     }
 }
@@ -11527,9 +11606,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState1(d3d12_command
             cmd.shader.hash = state->breadcrumb_shaders[i].hash;
             vkd3d_breadcrumb_tracer_add_command(list, &cmd);
 
-            cmd.type = VKD3D_BREADCRUMB_COMMAND_TAG;
-            cmd.tag = state->breadcrumb_shaders[i].name;
-            vkd3d_breadcrumb_tracer_add_command(list, &cmd);
+            VKD3D_BREADCRUMB_TAG(state->breadcrumb_shaders[i].name);
         }
     }
 #endif
@@ -12294,6 +12371,9 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     size_t num_transitions, num_command_buffers;
     struct d3d12_command_queue_submission sub;
     struct d3d12_command_list *cmd_list;
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    unsigned int *breadcrumb_indices;
+#endif
     VkCommandBuffer *buffers;
     LONG **outstanding;
     unsigned int i, j;
@@ -12341,6 +12421,13 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         return;
     }
 
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE)
+        breadcrumb_indices = vkd3d_malloc(sizeof(unsigned int) * command_list_count);
+    else
+        breadcrumb_indices = NULL;
+#endif
+
     sub.execute.debug_capture = false;
 
     num_transitions = 0;
@@ -12355,6 +12442,9 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
                     "Command list %p is in recording state.\n", command_lists[i]);
             vkd3d_free(outstanding);
             vkd3d_free(buffers);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+            vkd3d_free(breadcrumb_indices);
+#endif
             return;
         }
 
@@ -12368,6 +12458,11 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         buffers[j++] = cmd_list->vk_command_buffer;
         if (cmd_list->debug_capture)
             sub.execute.debug_capture = true;
+
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+        if (breadcrumb_indices)
+            breadcrumb_indices[i] = cmd_list->breadcrumb_context_index;
+#endif
     }
 
     /* Append a full GPU barrier between submissions.
@@ -12409,6 +12504,10 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     sub.execute.cmd_count = num_command_buffers;
     sub.execute.outstanding_submissions_counters = outstanding;
     sub.execute.outstanding_submissions_counter_count = command_list_count;
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    sub.execute.breadcrumb_indices = breadcrumb_indices;
+    sub.execute.breadcrumb_indices_count = breadcrumb_indices ? command_list_count : 0;
+#endif
     d3d12_command_queue_add_submission(command_queue, &sub);
 }
 
@@ -13506,6 +13605,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
     struct d3d12_command_queue *queue = userdata;
     uint64_t transition_timeline_value = 0;
     VkCommandBuffer transition_cmd;
+    VKD3D_UNUSED unsigned int i;
     HRESULT hr;
 
     VKD3D_REGION_DECL(queue_wait);
@@ -13577,6 +13677,18 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
              * On error, the counters are freed early, so there is no risk of leak. */
             vkd3d_free(submission.execute.cmd);
             vkd3d_free(submission.execute.transitions);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+            for (i = 0; i < submission.execute.breadcrumb_indices_count; i++)
+            {
+                INFO("=== Executing command list context %u on VkQueue %p, queue family %u ===\n",
+                        submission.execute.breadcrumb_indices[i],
+                        (void*)queue->vkd3d_queue->vk_queue, queue->vkd3d_queue->vk_family_index);
+                vkd3d_breadcrumb_tracer_dump_command_list(&queue->device->breadcrumb_tracer,
+                        submission.execute.breadcrumb_indices[i]);
+                INFO("============================\n");
+            }
+            vkd3d_free(submission.execute.breadcrumb_indices);
+#endif
             VKD3D_REGION_END(queue_execute);
             break;
 
