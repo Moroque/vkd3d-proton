@@ -2352,12 +2352,50 @@ struct vkd3d_image_copy_info
     VkImageLayout dst_layout;
 };
 
+struct vkd3d_query_resolve_entry
+{
+    D3D12_QUERY_TYPE query_type;
+    struct d3d12_query_heap *query_heap;
+    uint32_t query_index;
+    uint32_t query_count;
+    struct d3d12_resource *dst_buffer;
+    VkDeviceSize dst_offset;
+};
+
+#define VKD3D_QUERY_LOOKUP_GRANULARITY_BITS (6u)
+#define VKD3D_QUERY_LOOKUP_GRANULARITY (1u << VKD3D_QUERY_LOOKUP_GRANULARITY_BITS)
+#define VKD3D_QUERY_LOOKUP_INDEX_MASK (VKD3D_QUERY_LOOKUP_GRANULARITY - 1u)
+
+struct vkd3d_query_lookup_key
+{
+    struct d3d12_query_heap *query_heap;
+    uint32_t bucket;
+};
+
+struct vkd3d_query_lookup_entry
+{
+    struct hash_map_entry hash_entry;
+    struct vkd3d_query_lookup_key key;
+    uint64_t query_mask;
+};
+
 #define VKD3D_COPY_TEXTURE_REGION_MAX_BATCH_SIZE 16
 
 struct d3d12_transfer_batch_state
 {
     enum vkd3d_batch_type batch_type;
     struct vkd3d_image_copy_info batch[VKD3D_COPY_TEXTURE_REGION_MAX_BATCH_SIZE];
+    size_t batch_len;
+};
+
+#define VKD3D_MAX_WBI_BATCH_SIZE 128
+
+struct d3d12_wbi_batch_state
+{
+    VkBuffer buffers[VKD3D_MAX_WBI_BATCH_SIZE];
+    VkDeviceSize offsets[VKD3D_MAX_WBI_BATCH_SIZE];
+    VkPipelineStageFlags stages[VKD3D_MAX_WBI_BATCH_SIZE];
+    uint32_t values[VKD3D_MAX_WBI_BATCH_SIZE];
     size_t batch_len;
 };
 
@@ -2480,10 +2518,17 @@ struct d3d12_command_list
     size_t subresource_tracking_count;
     size_t subresource_tracking_size;
 
+    struct vkd3d_query_resolve_entry *query_resolves;
+    size_t query_resolve_count;
+    size_t query_resolve_size;
+
+    struct hash_map query_resolve_lut;
+
     struct d3d12_buffer_copy_tracked_buffer tracked_copy_buffers[VKD3D_BUFFER_COPY_TRACKING_BUFFER_COUNT];
     unsigned int tracked_copy_buffer_count;
 
     struct d3d12_transfer_batch_state transfer_batch;
+    struct d3d12_wbi_batch_state wbi_batch;
 
     struct vkd3d_private_store private_store;
 
