@@ -175,6 +175,8 @@ struct vkd3d_vulkan_info
     bool EXT_shader_module_identifier;
     bool EXT_descriptor_buffer;
     bool EXT_pipeline_library_group_handles;
+    bool EXT_image_sliced_view_of_3d;
+    bool EXT_graphics_pipeline_library;
     /* AMD device extensions */
     bool AMD_buffer_marker;
     bool AMD_device_coherent_memory;
@@ -1089,6 +1091,8 @@ struct vkd3d_view
             unsigned int miplevel_idx;
             unsigned int layer_idx;
             unsigned int layer_count;
+            unsigned int w_offset;
+            unsigned int w_size;
         } texture;
     } info;
 };
@@ -1115,6 +1119,8 @@ struct vkd3d_texture_view_desc
     unsigned int miplevel_count;
     unsigned int layer_idx;
     unsigned int layer_count;
+    unsigned int w_offset;
+    unsigned int w_size;
     float miplevel_clamp;
     VkComponentMapping components;
     bool allowed_swizzle;
@@ -1433,6 +1439,7 @@ struct d3d12_query_heap
     VkQueryPool vk_query_pool;
     struct vkd3d_device_memory_allocation device_allocation;
     VkBuffer vk_buffer;
+    VkDeviceAddress va;
     uint32_t initialized;
 
     struct d3d12_device *device;
@@ -1684,6 +1691,70 @@ struct vkd3d_shader_debug_ring_spec_constants
     uint32_t ring_words;
 };
 
+#define VKD3D_MAX_VERTEX_INPUT_DYNAMIC_STATES (3u)
+#define VKD3D_VERTEX_INPUT_DYNAMIC_STATE_MASK (VKD3D_DYNAMIC_STATE_TOPOLOGY |\
+                VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE |\
+                VKD3D_DYNAMIC_STATE_PRIMITIVE_RESTART)
+
+struct vkd3d_vertex_input_pipeline_desc
+{
+    VkVertexInputBindingDivisorDescriptionEXT vi_divisors[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vi_divisor_info;
+
+    VkVertexInputAttributeDescription vi_attributes[D3D12_VS_INPUT_REGISTER_COUNT];
+    VkVertexInputBindingDescription vi_bindings[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    VkPipelineVertexInputStateCreateInfo vi_info;
+
+    VkPipelineInputAssemblyStateCreateInfo ia_info;
+
+    VkDynamicState dy_states[VKD3D_MAX_VERTEX_INPUT_DYNAMIC_STATES];
+    VkPipelineDynamicStateCreateInfo dy_info;
+};
+
+struct vkd3d_vertex_input_pipeline
+{
+    struct hash_map_entry entry;
+    struct vkd3d_vertex_input_pipeline_desc desc;
+    VkPipeline vk_pipeline;
+};
+
+uint32_t vkd3d_vertex_input_pipeline_desc_hash(const void *key);
+bool vkd3d_vertex_input_pipeline_desc_compare(const void *key, const struct hash_map_entry *entry);
+VkPipeline vkd3d_vertex_input_pipeline_create(struct d3d12_device *device,
+        const struct vkd3d_vertex_input_pipeline_desc *desc);
+void vkd3d_vertex_input_pipeline_free(struct hash_map_entry *entry, void *userdata);
+
+#define VKD3D_MAX_FRAGMENT_OUTPUT_DYNAMIC_STATES (1u)
+#define VKD3D_FRAGMENT_OUTPUT_DYNAMIC_STATE_MASK (VKD3D_DYNAMIC_STATE_BLEND_CONSTANTS)
+
+struct vkd3d_fragment_output_pipeline_desc
+{
+    VkPipelineColorBlendAttachmentState cb_attachments[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    VkPipelineColorBlendStateCreateInfo cb_info;
+
+    VkSampleMask ms_sample_mask;
+    VkPipelineMultisampleStateCreateInfo ms_info;
+
+    VkFormat rt_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    VkPipelineRenderingCreateInfo rt_info;
+
+    VkDynamicState dy_states[VKD3D_MAX_FRAGMENT_OUTPUT_DYNAMIC_STATES];
+    VkPipelineDynamicStateCreateInfo dy_info;
+};
+
+struct vkd3d_fragment_output_pipeline
+{
+    struct hash_map_entry entry;
+    struct vkd3d_fragment_output_pipeline_desc desc;
+    VkPipeline vk_pipeline;
+};
+
+uint32_t vkd3d_fragment_output_pipeline_desc_hash(const void *key);
+bool vkd3d_fragment_output_pipeline_desc_compare(const void *key, const struct hash_map_entry *entry);
+VkPipeline vkd3d_fragment_output_pipeline_create(struct d3d12_device *device,
+        const struct vkd3d_fragment_output_pipeline_desc *desc);
+void vkd3d_fragment_output_pipeline_free(struct hash_map_entry *entry, void *userdata);
+
 #define VKD3D_SHADER_DEBUG_RING_SPEC_INFO_MAP_ENTRIES 4
 struct vkd3d_shader_debug_ring_spec_info
 {
@@ -1753,7 +1824,7 @@ struct d3d12_graphics_pipeline_state
     VkPipelineDepthStencilStateCreateInfo ds_desc;
     VkPipelineColorBlendStateCreateInfo blend_desc;
 
-    VkSampleMask sample_mask[2];
+    VkSampleMask sample_mask;
     VkPipelineRasterizationConservativeStateCreateInfoEXT rs_conservative_info;
     VkPipelineRasterizationDepthClipStateCreateInfoEXT rs_depth_clip_info;
     VkPipelineRasterizationStateStreamCreateInfoEXT rs_stream_info;
@@ -1762,6 +1833,9 @@ struct d3d12_graphics_pipeline_state
 
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
+    VkPipeline library;
+    VkGraphicsPipelineLibraryFlagsEXT library_flags;
+    VkPipelineCreateFlags library_create_flags;
     struct list compiled_fallback_pipelines;
 
     bool xfb_enabled;
@@ -1918,7 +1992,7 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
         uint32_t *dynamic_state_flags);
 VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format,
-        VkPipelineCache vk_cache, uint32_t *dynamic_state_flags);
+        VkPipelineCache vk_cache, VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags);
 
 static inline struct d3d12_pipeline_state *impl_from_ID3D12PipelineState(ID3D12PipelineState *iface)
 {
@@ -2228,7 +2302,7 @@ struct vkd3d_dynamic_state
 };
 
 /* ID3D12CommandList */
-typedef ID3D12GraphicsCommandList6 d3d12_command_list_iface;
+typedef ID3D12GraphicsCommandList9 d3d12_command_list_iface;
 
 enum vkd3d_initial_transition_type
 {
@@ -2995,6 +3069,8 @@ struct vkd3d_breadcrumb_command_list_trace_context
     size_t command_count;
     uint32_t counter;
     uint32_t locked;
+    uint32_t prev;
+    uint32_t next;
 };
 
 struct vkd3d_breadcrumb_tracer
@@ -3031,6 +3107,8 @@ void vkd3d_breadcrumb_tracer_add_command(struct d3d12_command_list *list,
         const struct vkd3d_breadcrumb_command *command);
 void vkd3d_breadcrumb_tracer_signal(struct d3d12_command_list *list);
 void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list);
+void vkd3d_breadcrumb_tracer_link_submission(struct d3d12_command_list *list,
+        struct d3d12_command_list *prev, struct d3d12_command_list *next);
 
 #define VKD3D_BREADCRUMB_FLUSH_BATCHES(list) do { \
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
@@ -3487,31 +3565,30 @@ void vkd3d_swapchain_ops_cleanup(struct vkd3d_swapchain_ops *meta_swapchain_ops,
 
 struct vkd3d_query_resolve_args
 {
-    uint32_t dst_index;
-    uint32_t src_index;
+    VkDeviceAddress dst_va;
+    VkDeviceAddress src_va;
     uint32_t query_count;
 };
 
 struct vkd3d_query_gather_args
 {
+    VkDeviceAddress dst_va;
+    VkDeviceAddress src_va;
+    VkDeviceAddress map_va;
     uint32_t query_count;
-    uint32_t entry_offset;
 };
 
 struct vkd3d_query_gather_info
 {
-    VkDescriptorSetLayout vk_set_layout;
     VkPipelineLayout vk_pipeline_layout;
     VkPipeline vk_pipeline;
 };
 
 struct vkd3d_query_ops
 {
-    VkDescriptorSetLayout vk_gather_set_layout;
     VkPipelineLayout vk_gather_pipeline_layout;
     VkPipeline vk_gather_occlusion_pipeline;
     VkPipeline vk_gather_so_statistics_pipeline;
-    VkDescriptorSetLayout vk_resolve_set_layout;
     VkPipelineLayout vk_resolve_pipeline_layout;
     VkPipeline vk_resolve_binary_pipeline;
 };
@@ -3750,6 +3827,8 @@ struct vkd3d_physical_device_info
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer_features;
     VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT pipeline_library_group_handles_features;
+    VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT image_sliced_view_of_3d_features;
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features;
 
     VkPhysicalDeviceFeatures2 features2;
 
@@ -3807,7 +3886,7 @@ struct vkd3d_cached_command_allocator
 };
 
 /* ID3D12Device */
-typedef ID3D12Device9 d3d12_device_iface;
+typedef ID3D12Device10 d3d12_device_iface;
 
 struct vkd3d_descriptor_qa_global_info;
 struct vkd3d_descriptor_qa_heap_buffer_data;
@@ -3882,6 +3961,10 @@ struct d3d12_device
     struct vkd3d_shader_debug_ring debug_ring;
     struct vkd3d_pipeline_library_disk_cache disk_cache;
     struct vkd3d_global_descriptor_buffer global_descriptor_buffer;
+    rwlock_t vertex_input_lock;
+    struct hash_map vertex_input_pipelines;
+    rwlock_t fragment_output_lock;
+    struct hash_map fragment_output_pipelines;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     struct vkd3d_breadcrumb_tracer breadcrumb_tracer;
 #endif
@@ -3903,6 +3986,11 @@ bool d3d12_device_is_uma(struct d3d12_device *device, bool *coherent);
 void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
         const char *message, ...) VKD3D_PRINTF_FUNC(3, 4);
 
+VkPipeline d3d12_device_get_or_create_vertex_input_pipeline(struct d3d12_device *device,
+        const struct vkd3d_vertex_input_pipeline_desc *desc);
+VkPipeline d3d12_device_get_or_create_fragment_output_pipeline(struct d3d12_device *device,
+        const struct vkd3d_fragment_output_pipeline_desc *desc);
+
 static inline struct d3d12_device *unsafe_impl_from_ID3D12Device(d3d12_device_iface *iface)
 {
     return CONTAINING_RECORD(iface, struct d3d12_device, ID3D12Device_iface);
@@ -3910,9 +3998,9 @@ static inline struct d3d12_device *unsafe_impl_from_ID3D12Device(d3d12_device_if
 
 static inline struct d3d12_device *impl_from_ID3D12Device(d3d12_device_iface *iface)
 {
-    extern CONST_VTBL struct ID3D12Device9Vtbl d3d12_device_vtbl;
+    extern CONST_VTBL struct ID3D12Device10Vtbl d3d12_device_vtbl;
 #ifdef VKD3D_ENABLE_PROFILING
-    extern CONST_VTBL struct ID3D12Device9Vtbl d3d12_device_vtbl_profiled;
+    extern CONST_VTBL struct ID3D12Device10Vtbl d3d12_device_vtbl_profiled;
 #endif
     if (!iface)
         return NULL;
@@ -3971,17 +4059,17 @@ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_inf
 
 static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
 {
-    return ID3D12Device9_QueryInterface(&device->ID3D12Device_iface, iid, object);
+    return ID3D12Device10_QueryInterface(&device->ID3D12Device_iface, iid, object);
 }
 
 static inline ULONG d3d12_device_add_ref(struct d3d12_device *device)
 {
-    return ID3D12Device9_AddRef(&device->ID3D12Device_iface);
+    return ID3D12Device10_AddRef(&device->ID3D12Device_iface);
 }
 
 static inline ULONG d3d12_device_release(struct d3d12_device *device)
 {
-    return ID3D12Device9_Release(&device->ID3D12Device_iface);
+    return ID3D12Device10_Release(&device->ID3D12Device_iface);
 }
 
 static inline unsigned int d3d12_device_get_descriptor_handle_increment_size(
@@ -4330,11 +4418,6 @@ static inline unsigned int d3d12_resource_get_sub_resource_count(const struct d3
 VkDeviceAddress vkd3d_get_buffer_device_address(struct d3d12_device *device, VkBuffer vk_buffer);
 VkDeviceAddress vkd3d_get_acceleration_structure_device_address(struct d3d12_device *device,
         VkAccelerationStructureKHR vk_acceleration_structure);
-
-static inline VkDeviceAddress d3d12_resource_get_va(const struct d3d12_resource *resource, VkDeviceSize offset)
-{
-    return vkd3d_get_buffer_device_address(resource->device, resource->res.vk_buffer) + resource->mem.offset + offset;
-}
 
 static inline unsigned int vkd3d_compute_workgroup_count(unsigned int thread_count, unsigned int workgroup_size)
 {
