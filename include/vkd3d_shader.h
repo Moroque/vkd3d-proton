@@ -71,6 +71,7 @@ enum vkd3d_shader_meta_flags
     VKD3D_SHADER_META_FLAG_USES_INT64_ATOMICS_IMAGE = 1 << 10,
     VKD3D_SHADER_META_FLAG_USES_FRAGMENT_BARYCENTRIC = 1 << 11,
     VKD3D_SHADER_META_FLAG_USES_SAMPLE_RATE_SHADING = 1 << 12,
+    VKD3D_SHADER_META_FLAG_USES_RASTERIZER_ORDERED_VIEWS = 1 << 13,
 };
 
 struct vkd3d_shader_meta
@@ -707,6 +708,7 @@ struct vkd3d_shader_scan_info
     bool has_uav_counter;
     bool declares_globally_coherent_uav;
     bool requires_thread_group_uav_coherency;
+    bool requires_rov;
     unsigned int patch_vertex_count;
 };
 
