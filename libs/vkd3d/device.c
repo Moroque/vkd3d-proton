@@ -579,6 +579,11 @@ static const struct vkd3d_shader_quirk_info borderlands3_quirks = {
     borderlands3_hashes, ARRAY_SIZE(borderlands3_hashes), 0,
 };
 
+/* Terrain is rendered with extreme tessellation factors. Limit it to something more reasonable. */
+static const struct vkd3d_shader_quirk_info wolong_quirks = {
+    NULL, 0, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
@@ -588,6 +593,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "F1_2019_dx12.exe", &f1_2019_2020_quirks },
     /* Borderlands 3 (397540) */
     { VKD3D_STRING_COMPARE_EXACT, "Borderlands3.exe", &borderlands3_quirks },
+    /* Wo Long: Fallen Dynasty (2285240) */
+    { VKD3D_STRING_COMPARE_EXACT, "WoLong.exe", &wolong_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -672,6 +679,9 @@ static void vkd3d_instance_deduce_config_flags_from_environment(void)
 
 static void vkd3d_instance_apply_global_shader_quirks(void)
 {
+    unsigned int level;
+    char env[64];
+
     struct override
     {
         uint64_t config;
@@ -691,6 +701,41 @@ static void vkd3d_instance_apply_global_shader_quirks(void)
         eq_test = overrides[i].negative ? 0 : overrides[i].config;
         if ((vkd3d_config_flags & overrides[i].config) == eq_test)
             vkd3d_shader_quirk_info.global_quirks |= overrides[i].quirk;
+    }
+
+    if (vkd3d_get_env_var("VKD3D_LIMIT_TESS_FACTORS", env, sizeof(env)))
+    {
+        static const struct
+        {
+            unsigned int level;
+            uint32_t quirk;
+        } mapping[] = {
+            { 4, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_4 },
+            { 8, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8 },
+            { 12, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_12 },
+            { 16, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_16 },
+            { 32, VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_32 },
+        };
+
+        /* Override what any app profile did. */
+        vkd3d_shader_quirk_info.global_quirks &= ~(VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_4 |
+                VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8 |
+                VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_12 |
+                VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_16 |
+                VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_32);
+
+        level = strtoul(env, NULL, 0);
+        INFO("Attempting to limit tessellation factors to %ux.\n", level);
+
+        for (i = 0; i < ARRAY_SIZE(mapping); i++)
+        {
+            if (level <= mapping[i].level)
+            {
+                INFO("Limiting tessellation factors to %ux.\n", mapping[i].level);
+                vkd3d_shader_quirk_info.global_quirks |= mapping[i].quirk;
+                break;
+            }
+        }
     }
 }
 
