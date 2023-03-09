@@ -2315,7 +2315,7 @@ static void d3d12_pipeline_state_init_compile_arguments(struct d3d12_pipeline_st
 
 static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *required_subgroup_size_info,
         const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *identifier_create_info,
         const struct vkd3d_shader_code *spirv_code)
 {
@@ -2333,16 +2333,15 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
     if (!spirv_code->size && identifier_create_info && identifier_create_info->identifierSize)
         stage_desc->pNext = identifier_create_info;
 
-    if (((spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE) &&
-            device->device_info.subgroup_size_control_features.subgroupSizeControl) ||
+    if ((spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS) ||
             spirv_code->meta.cs_required_wave_size)
     {
-        uint32_t subgroup_size_alignment = device->device_info.subgroup_size_control_properties.maxSubgroupSize;
-        stage_desc->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
+        uint32_t subgroup_size_alignment = device->device_info.vulkan_1_3_properties.maxSubgroupSize;
+        stage_desc->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
 
         if (required_subgroup_size_info)
         {
-            required_subgroup_size_info->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+            required_subgroup_size_info->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
             required_subgroup_size_info->pNext = (void*)stage_desc->pNext;
 
             if (spirv_code->meta.cs_required_wave_size)
@@ -2351,10 +2350,10 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
                 subgroup_size_alignment = spirv_code->meta.cs_required_wave_size;
 
                 /* If min == max, we can still support WaveSize in a dummy kind of way. */
-                if (device->device_info.subgroup_size_control_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
+                if (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
                     stage_desc->pNext = required_subgroup_size_info;
 
-                stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
+                stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
             }
             else if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_MINIMUM_SUBGROUP_SIZE) &&
                     d3d12_device_supports_required_subgroup_size_for_stage(device, stage))
@@ -2363,13 +2362,13 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
                  * This shader variant unfortunately expects that a subgroup 32 variant will actually use wave32 on AMD.
                  * amdgpu-pro and AMDVLK happens to emit wave32, but RADV will emit wave64 here unless we force it to be wave32.
                  * This is an application bug, since the shader is not guaranteed a specific size, but we can only workaround ... */
-                subgroup_size_alignment = device->device_info.subgroup_size_control_properties.minSubgroupSize;
+                subgroup_size_alignment = device->device_info.vulkan_1_3_properties.minSubgroupSize;
 
                 /* If min == max, we can still support WaveSize in a dummy kind of way. */
-                if (device->device_info.subgroup_size_control_properties.requiredSubgroupSizeStages & stage)
+                if (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & stage)
                     stage_desc->pNext = required_subgroup_size_info;
 
-                stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
+                stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
             }
 
             required_subgroup_size_info->requiredSubgroupSize = subgroup_size_alignment;
@@ -2378,10 +2377,9 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
         /* If we can, we should be explicit and enable FULL_SUBGROUPS bit as well. This should be default
          * behavior, but cannot hurt. */
         if (stage == VK_SHADER_STAGE_COMPUTE_BIT &&
-                device->device_info.subgroup_size_control_features.computeFullSubgroups &&
                 !(spirv_code->meta.cs_workgroup_size[0] % subgroup_size_alignment))
         {
-            stage_desc->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+            stage_desc->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         }
     }
 
@@ -2576,9 +2574,9 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         struct d3d12_device *device,
         const D3D12_SHADER_BYTECODE *code)
 {
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size_info;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_subgroup_size_info;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkPipelineCreationFeedbackCreateInfoEXT feedback_info;
+    VkPipelineCreationFeedbackCreateInfo feedback_info;
     struct vkd3d_shader_debug_ring_spec_info spec_info;
     VkPipelineCreationFeedbackEXT feedbacks[1];
     VkComputePipelineCreateInfo pipeline_info;
@@ -2630,10 +2628,9 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
 
     TRACE("Calling vkCreateComputePipelines.\n");
 
-    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG) &&
-            device->vk_info.EXT_pipeline_creation_feedback)
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
-        feedback_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT;
+        feedback_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;
         feedback_info.pNext = pipeline_info.pNext;
         feedback_info.pPipelineStageCreationFeedbacks = feedbacks;
         feedback_info.pipelineStageCreationFeedbackCount = 1;
@@ -2644,7 +2641,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         feedback_info.pipelineStageCreationFeedbackCount = 0;
 
     if (pipeline_info.stage.module == VK_NULL_HANDLE)
-        pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
     if (d3d12_device_uses_descriptor_buffers(device))
         pipeline_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -2654,11 +2651,11 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
 
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
-        if (pipeline_info.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT)
+        if (pipeline_info.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
         {
             if (vr == VK_SUCCESS)
                 INFO("[IDENTIFIER] Successfully created compute pipeline from identifier.\n");
-            else if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+            else if (vr == VK_PIPELINE_COMPILE_REQUIRED)
                 INFO("[IDENTIFIER] Failed to create compute pipeline from identifier, falling back ...\n");
         }
         else
@@ -2666,9 +2663,9 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     }
 
     /* Fallback. */
-    if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    if (vr == VK_PIPELINE_COMPILE_REQUIRED)
     {
-        pipeline_info.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        pipeline_info.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
         if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
                 VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code)))
@@ -4836,7 +4833,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
             vk_cache, 1, &create_info, NULL, vk_pipeline));
 
-    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    if (vr != VK_SUCCESS && vr != VK_PIPELINE_COMPILE_REQUIRED)
         ERR("Failed to create link pipeline, vr %d.\n", vr);
 
     return vr;
@@ -4999,15 +4996,14 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     /* If we're using identifiers, set the appropriate flag. */
     for (i = 0; i < graphics->stage_count; i++)
         if (pipeline_desc.pStages[i].module == VK_NULL_HANDLE)
-            pipeline_desc.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+            pipeline_desc.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
     if (d3d12_device_uses_descriptor_buffers(device))
         pipeline_desc.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
     TRACE("Calling vkCreateGraphicsPipelines.\n");
 
-    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG) &&
-            device->vk_info.EXT_pipeline_creation_feedback)
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
         feedback_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT;
         feedback_info.pNext = pipeline_desc.pNext;
@@ -5023,18 +5019,18 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
-        if (pipeline_desc.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT)
+        if (pipeline_desc.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
         {
             if (vr == VK_SUCCESS)
                 INFO("[IDENTIFIER] Successfully created graphics pipeline from identifier.\n");
-            else if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+            else if (vr == VK_PIPELINE_COMPILE_REQUIRED)
                 INFO("[IDENTIFIER] Failed to create graphics pipeline from identifier, falling back ...\n");
         }
         else
             INFO("[IDENTIFIER] No graphics identifier\n");
     }
 
-    if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    if (vr == VK_PIPELINE_COMPILE_REQUIRED)
     {
         if (FAILED(hr = vkd3d_late_compile_shader_stages(state)))
         {
@@ -5043,7 +5039,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
             goto err;
         }
 
-        pipeline_desc.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        pipeline_desc.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
         /* Internal modules are known to be non-null now. */
         pipeline_desc.pStages = state->graphics.stages;
         vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
@@ -5062,7 +5058,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         vkd3d_report_pipeline_creation_feedback_results(&feedback_info);
 
     if (library_flags)
-        graphics->library_create_flags = pipeline_desc.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        graphics->library_create_flags = pipeline_desc.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
 err:
     /* Clean up any temporary SPIR-V modules we created. */
@@ -5194,7 +5190,7 @@ static uint32_t d3d12_max_descriptor_count_from_heap_type(D3D12_DESCRIPTOR_HEAP_
 
 static uint32_t d3d12_max_host_descriptor_count_from_heap_type(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
 {
-    const VkPhysicalDeviceDescriptorIndexingPropertiesEXT *limits = &device->device_info.descriptor_indexing_properties;
+    const VkPhysicalDeviceVulkan12Properties *limits = &device->device_info.vulkan_1_2_properties;
 
     switch (heap_type)
     {
@@ -5221,29 +5217,20 @@ static uint32_t d3d12_max_host_descriptor_count_from_heap_type(struct d3d12_devi
 static uint32_t vkd3d_bindless_build_mutable_type_list(VkDescriptorType *list, uint32_t flags)
 {
     uint32_t count = 0;
-    if (flags & VKD3D_BINDLESS_CBV)
-    {
-        list[count++] = flags & VKD3D_BINDLESS_CBV_AS_SSBO ?
-                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    }
 
-    if (flags & VKD3D_BINDLESS_UAV)
-    {
-        list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    list[count++] = flags & VKD3D_BINDLESS_CBV_AS_SSBO ?
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
-        /* This behavior should be default, but there are too many broken games.
-         * Can be used as a perf/memory opt-in.
-         * Will likely be required on Intel as well due to anemic bindless sizes. */
-        if ((flags & VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO) && !(flags & VKD3D_BINDLESS_CBV_AS_SSBO))
-            list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    }
+    list[count++] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    list[count++] = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
 
-    if (flags & VKD3D_BINDLESS_SRV)
-    {
-        list[count++] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        list[count++] = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-    }
+    /* This behavior should be default, but there are too many broken games.
+     * Can be used as a perf/memory opt-in.
+     * Will likely be required on Intel as well due to anemic bindless sizes. */
+    if ((flags & VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO) && !(flags & VKD3D_BINDLESS_CBV_AS_SSBO))
+        list[count++] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 
     return count;
 }
@@ -5390,9 +5377,9 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
     VkMutableDescriptorTypeListEXT mutable_descriptor_list[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
     struct vkd3d_bindless_set_info *set_info = &bindless_state->set_info[bindless_state->set_count];
     VkDescriptorSetLayoutBinding vk_binding_info[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
-    VkDescriptorBindingFlagsEXT vk_binding_flags[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
+    VkDescriptorBindingFlags vk_binding_flags[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
     VkDescriptorType mutable_descriptor_types[VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES];
-    VkDescriptorSetLayoutBindingFlagsCreateInfoEXT vk_binding_flags_info;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo vk_binding_flags_info;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDescriptorSetLayoutHostMappingInfoVALVE mapping_info;
     VkDescriptorSetBindingReferenceVALVE binding_reference;
@@ -5440,19 +5427,19 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
     if (d3d12_device_uses_descriptor_buffers(device))
     {
         /* All update-after-bind features are implied when using descriptor buffers. */
-        vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
+        vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
         vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
     else
     {
-         vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT |
-                VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT_EXT |
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT |
-                VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
-        vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
+         vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |
+                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+        vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
     }
 
-    vk_binding_flags_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
+    vk_binding_flags_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
     vk_binding_flags_info.pNext = NULL;
     vk_binding_flags_info.bindingCount = set_info->binding_index + 1;
     vk_binding_flags_info.pBindingFlags = vk_binding_flags;
@@ -5540,7 +5527,7 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
         {
             /* If we have mutable descriptor extension, we will allocate these descriptors with
              * HOST_BIT and not UPDATE_AFTER_BIND, since that is enough to get threading guarantees. */
-            vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
+            vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
             vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_EXT;
         }
 
@@ -5558,20 +5545,20 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
 {
     VkDescriptorType descriptor_types[VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES];
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkDescriptorSetLayoutBindingFlagsCreateInfoEXT binding_flags;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags;
     VkMutableDescriptorTypeCreateInfoEXT mutable_info;
     VkDescriptorSetLayoutCreateInfo set_layout_info;
     VkMutableDescriptorTypeListVALVE mutable_list;
-    VkDescriptorBindingFlagsEXT binding_flag;
     VkDescriptorSetLayoutSupport supported;
+    VkDescriptorBindingFlags binding_flag;
     VkDescriptorSetLayoutBinding binding;
 
-    binding_flag = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
+    binding_flag = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
     if (!d3d12_device_uses_descriptor_buffers(device))
     {
-        binding_flag |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT |
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT |
-                VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT_EXT;
+        binding_flag |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
     }
 
     if (!device->device_info.mutable_descriptor_features.mutableDescriptorType)
@@ -5591,7 +5578,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     binding.pImmutableSamplers = NULL;
     binding.stageFlags = VK_SHADER_STAGE_ALL;
 
-    binding_flags.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
+    binding_flags.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
     binding_flags.pNext = &mutable_info;
     binding_flags.bindingCount = 1;
     binding_flags.pBindingFlags = &binding_flag;
@@ -5616,7 +5603,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     if (!d3d12_device_uses_descriptor_buffers(device))
     {
         set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_EXT;
-        binding_flag = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
+        binding_flag = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
         VK_CALL(vkGetDescriptorSetLayoutSupport(device->vk_device, &set_layout_info, &supported));
     }
 
@@ -5626,57 +5613,22 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
 static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *device)
 {
     const struct vkd3d_physical_device_info *device_info = &device->device_info;
-    const struct vkd3d_vulkan_info *vk_info = &device->vk_info;
-    bool supports_partially_bound;
     uint32_t flags = 0;
 
-    supports_partially_bound = (device_info->descriptor_indexing_features.descriptorBindingPartiallyBound &&
-            device_info->descriptor_indexing_features.descriptorBindingUpdateUnusedWhilePending) ||
-            d3d12_device_uses_descriptor_buffers(device);
-
-    if (!vk_info->EXT_descriptor_indexing ||
-            !device_info->descriptor_indexing_features.runtimeDescriptorArray ||
-            !supports_partially_bound ||
-            !device_info->descriptor_indexing_features.descriptorBindingVariableDescriptorCount)
-        return 0;
-
-    if (d3d12_device_uses_descriptor_buffers(device))
+    if (!d3d12_device_uses_descriptor_buffers(device))
     {
-        /* UpdateAfterBind rules don't apply here. */
-        flags |= VKD3D_BINDLESS_SAMPLER | VKD3D_BINDLESS_SRV | VKD3D_BINDLESS_CBV | VKD3D_BINDLESS_UAV;
-    }
-    else
-    {
-        if (device_info->descriptor_indexing_properties.maxPerStageDescriptorUpdateAfterBindSampledImages >= 1000000 &&
-                device_info->descriptor_indexing_features.descriptorBindingSampledImageUpdateAfterBind &&
-                device_info->descriptor_indexing_features.descriptorBindingUniformTexelBufferUpdateAfterBind &&
-                device_info->descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing &&
-                device_info->descriptor_indexing_features.shaderUniformTexelBufferArrayNonUniformIndexing)
-            flags |= VKD3D_BINDLESS_SAMPLER | VKD3D_BINDLESS_SRV;
-
-        if (device_info->descriptor_indexing_properties.maxPerStageDescriptorUpdateAfterBindStorageImages >= 1000000 &&
-                device_info->descriptor_indexing_features.descriptorBindingStorageImageUpdateAfterBind &&
-                device_info->descriptor_indexing_features.descriptorBindingStorageTexelBufferUpdateAfterBind &&
-                device_info->descriptor_indexing_features.shaderStorageImageArrayNonUniformIndexing &&
-                device_info->descriptor_indexing_features.shaderStorageTexelBufferArrayNonUniformIndexing)
-            flags |= VKD3D_BINDLESS_UAV;
-
-        if (device_info->descriptor_indexing_properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers >= 1000000 &&
-                device_info->descriptor_indexing_features.descriptorBindingUniformBufferUpdateAfterBind &&
-                device_info->descriptor_indexing_features.shaderUniformBufferArrayNonUniformIndexing)
-            flags |= VKD3D_BINDLESS_CBV;
-        else if (device_info->descriptor_indexing_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= 1000000 &&
-                device_info->descriptor_indexing_features.descriptorBindingStorageBufferUpdateAfterBind &&
-                device_info->descriptor_indexing_features.shaderStorageBufferArrayNonUniformIndexing)
-            flags |= VKD3D_BINDLESS_CBV | VKD3D_BINDLESS_CBV_AS_SSBO;
+        if (device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers < 1000000 ||
+                !device_info->vulkan_1_2_features.descriptorBindingUniformBufferUpdateAfterBind ||
+                !device_info->vulkan_1_2_features.shaderUniformBufferArrayNonUniformIndexing)
+            flags |= VKD3D_BINDLESS_CBV_AS_SSBO;
     }
 
     /* Normally, we would be able to use SSBOs conditionally even when maxSSBOAlignment > 4, but
      * applications (RE2 being one example) are of course buggy and don't match descriptor and shader usage of resources,
      * so we cannot rely on alignment analysis to select the appropriate resource type. */
     if ((d3d12_device_uses_descriptor_buffers(device) ||
-            (device_info->descriptor_indexing_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= 1000000 &&
-                    device_info->descriptor_indexing_features.descriptorBindingStorageBufferUpdateAfterBind)) &&
+            (device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= 1000000 &&
+                    device_info->vulkan_1_2_features.descriptorBindingStorageBufferUpdateAfterBind)) &&
         device_info->properties2.properties.limits.minStorageBufferOffsetAlignment <= 16)
     {
         flags |= VKD3D_BINDLESS_RAW_SSBO;
@@ -5779,8 +5731,7 @@ static void vkd3d_bindless_state_init_null_descriptor_payloads(struct vkd3d_bind
 HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
         struct d3d12_device *device)
 {
-    const uint32_t required_flags = VKD3D_BINDLESS_SRV |
-            VKD3D_BINDLESS_UAV | VKD3D_BINDLESS_CBV | VKD3D_BINDLESS_SAMPLER;
+    const struct vkd3d_physical_device_info *device_info = &device->device_info;
     uint32_t extra_bindings = 0;
     bool use_raw_ssbo_binding;
     HRESULT hr = E_FAIL;
@@ -5788,10 +5739,15 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
     memset(bindless_state, 0, sizeof(*bindless_state));
     bindless_state->flags = vkd3d_bindless_state_get_bindless_flags(device);
 
-    if ((bindless_state->flags & required_flags) != required_flags)
+    if (!d3d12_device_uses_descriptor_buffers(device))
     {
-        ERR("Insufficient descriptor indexing support.\n");
-        goto fail;
+        if (device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindSampledImages < 1000000 ||
+                device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageImages < 1000000 ||
+                device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers < 1000000)
+        {
+            ERR("Insufficient descriptor indexing support.\n");
+            goto fail;
+        }
     }
 
     extra_bindings |= VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER;

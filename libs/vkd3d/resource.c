@@ -197,7 +197,7 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
         buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     }
 
-    buffer_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+    buffer_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
         buffer_info.usage |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
@@ -295,22 +295,19 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
 
 static bool d3d12_device_prefers_general_depth_stencil(const struct d3d12_device *device)
 {
-    if (device->vk_info.KHR_driver_properties)
+    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
     {
-        if (device->device_info.driver_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
-        {
-            /* NVIDIA doesn't really care about layouts for the most part. */
-            return true;
-        }
-        else if (device->device_info.driver_properties.driverID == VK_DRIVER_ID_MESA_RADV)
-        {
-            /* RADV can use TC-compat HTILE without too much issues on Polaris and later.
-             * Use GENERAL for these GPUs.
-             * Pre-Polaris we run into issues where even read-only depth requires decompress
-             * so using GENERAL shouldn't really make things worse, it's going to run pretty bad
-             * either way. */
-            return true;
-        }
+        /* NVIDIA doesn't really care about layouts for the most part. */
+        return true;
+    }
+    else if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    {
+        /* RADV can use TC-compat HTILE without too much issues on Polaris and later.
+         * Use GENERAL for these GPUs.
+         * Pre-Polaris we run into issues where even read-only depth requires decompress
+         * so using GENERAL shouldn't really make things worse, it's going to run pretty bad
+         * either way. */
+        return true;
     }
 
     return false;
@@ -492,7 +489,7 @@ struct vkd3d_image_create_info
 {
     struct vkd3d_format_compatibility_list format_compat_list;
     VkExternalMemoryImageCreateInfo external_info;
-    VkImageFormatListCreateInfoKHR format_list;
+    VkImageFormatListCreateInfo format_list;
     VkImageCreateInfo image_info;
 };
 
@@ -503,7 +500,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 {
     struct vkd3d_format_compatibility_list *compat_list = &create_info->format_compat_list;
     VkExternalMemoryImageCreateInfo *external_info = &create_info->external_info;
-    VkImageFormatListCreateInfoKHR *format_list = &create_info->format_list;
+    VkImageFormatListCreateInfo *format_list = &create_info->format_list;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkImageCreateInfo *image_info = &create_info->image_info;
     const bool sparse_resource = !heap_properties;
@@ -788,7 +785,7 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     if (FAILED(hr = vkd3d_get_image_create_info(device, &heap_properties, 0, desc, NULL, &create_info)))
         return hr;
 
-    requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS_KHR;
+    requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
     requirement_info.pNext = NULL;
     requirement_info.pCreateInfo = &create_info.image_info;
     requirement_info.planeAspect = 0; /* irrelevant for us */
@@ -796,7 +793,7 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     requirements.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
     requirements.pNext = NULL;
 
-    VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &requirement_info, &requirements));
+    VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &requirement_info, &requirements));
 
     allocation_info->SizeInBytes = requirements.memoryRequirements.size;
     allocation_info->Alignment = requirements.memoryRequirements.alignment;
@@ -806,7 +803,7 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     if (create_info.image_info.usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
     {
         create_info.image_info.usage &= ~VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
-        VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &requirement_info, &requirements));
+        VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &requirement_info, &requirements));
         allocation_info->SizeInBytes = max(requirements.memoryRequirements.size, allocation_info->SizeInBytes);
         allocation_info->Alignment = max(requirements.memoryRequirements.alignment, allocation_info->Alignment);
     }
@@ -2971,7 +2968,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         bind_info.memory = allocation->device_allocation.vk_memory;
         bind_info.memoryOffset = allocation->offset;
 
-        if ((vr = VK_CALL(vkBindImageMemory2KHR(device->vk_device, 1, &bind_info))))
+        if ((vr = VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind_info))))
         {
             ERR("Failed to bind image memory, vr %d.\n", vr);
             hr = hresult_from_vk_result(vr);
@@ -3175,7 +3172,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             bind_info.memoryOffset = object->mem.offset;
         }
 
-        if ((vr = VK_CALL(vkBindImageMemory2KHR(device->vk_device, 1, &bind_info))) < 0)
+        if ((vr = VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind_info))) < 0)
         {
             ERR("Failed to bind image memory, vr %d.\n", vr);
             hr = hresult_from_vk_result(vr);
@@ -4816,12 +4813,12 @@ VkDeviceAddress vkd3d_get_buffer_device_address(struct d3d12_device *device, VkB
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
 
-    VkBufferDeviceAddressInfoKHR address_info;
-    address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_KHR;
+    VkBufferDeviceAddressInfo address_info;
+    address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     address_info.pNext = NULL;
     address_info.buffer = vk_buffer;
 
-    return VK_CALL(vkGetBufferDeviceAddressKHR(device->vk_device, &address_info));
+    return VK_CALL(vkGetBufferDeviceAddress(device->vk_device, &address_info));
 }
 
 VkDeviceAddress vkd3d_get_acceleration_structure_device_address(struct d3d12_device *device,
@@ -5272,14 +5269,14 @@ static VkSamplerReductionModeEXT vk_reduction_mode_from_d3d12(D3D12_FILTER_REDUC
     {
         case D3D12_FILTER_REDUCTION_TYPE_STANDARD:
         case D3D12_FILTER_REDUCTION_TYPE_COMPARISON:
-            return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
+            return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
         case D3D12_FILTER_REDUCTION_TYPE_MINIMUM:
-            return VK_SAMPLER_REDUCTION_MODE_MIN_EXT;
+            return VK_SAMPLER_REDUCTION_MODE_MIN;
         case D3D12_FILTER_REDUCTION_TYPE_MAXIMUM:
-            return VK_SAMPLER_REDUCTION_MODE_MAX_EXT;
+            return VK_SAMPLER_REDUCTION_MODE_MAX;
         default:
             FIXME("Unhandled reduction mode %#x.\n", mode);
-            return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
+            return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
     }
 }
 
@@ -5372,7 +5369,8 @@ HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
         sampler_desc.borderColor = vk_static_border_color_from_d3d12(desc->BorderColor);
 
-    if (reduction_desc.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT && device->vk_info.EXT_sampler_filter_minmax)
+    if (reduction_desc.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE &&
+            device->device_info.vulkan_1_2_features.samplerFilterMinmax)
         vk_prepend_struct(&sampler_desc, &reduction_desc);
 
     if ((vr = VK_CALL(vkCreateSampler(device->vk_device, &sampler_desc, NULL, vk_sampler))) < 0)
@@ -5431,7 +5429,8 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
     if (sampler_desc.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT)
         vk_prepend_struct(&sampler_desc, &border_color_info);
 
-    if (reduction_desc.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT && device->vk_info.EXT_sampler_filter_minmax)
+    if (reduction_desc.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE &&
+            device->device_info.vulkan_1_2_features.samplerFilterMinmax)
         vk_prepend_struct(&sampler_desc, &reduction_desc);
 
     if ((vr = VK_CALL(vkCreateSampler(device->vk_device, &sampler_desc, NULL, vk_sampler))) < 0)
@@ -5917,7 +5916,7 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
 
     if (descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
     {
-        usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+        usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         {
             usage |= VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -6045,7 +6044,7 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_pool(struct d3d12_descrip
     vk_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     vk_pool_info.pNext = NULL;
 
-    vk_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
+    vk_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     if (!(descriptor_heap->desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
             (descriptor_heap->device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_TYPE))
         vk_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT;
@@ -7223,8 +7222,8 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkDeviceBufferMemoryRequirementsKHR buffer_requirement_info;
-    VkDeviceImageMemoryRequirementsKHR image_requirement_info;
+    VkDeviceBufferMemoryRequirements buffer_requirement_info;
+    VkDeviceImageMemoryRequirements image_requirement_info;
     VkMemoryRequirements2 memory_requirements;
     struct vkd3d_memory_topology topology;
     VkBufferCreateInfo buffer_info;
@@ -7245,11 +7244,11 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     if (pthread_mutex_init(&info->budget_lock, NULL) != 0)
         return E_OUTOFMEMORY;
 
-    buffer_requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS_KHR;
+    buffer_requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS;
     buffer_requirement_info.pNext = NULL;
     buffer_requirement_info.pCreateInfo = &buffer_info;
 
-    image_requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS_KHR;
+    image_requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
     image_requirement_info.pNext = NULL;
     image_requirement_info.pCreateInfo = &image_info;
     image_requirement_info.planeAspect = 0;
@@ -7279,7 +7278,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     }
 
-    VK_CALL(vkGetDeviceBufferMemoryRequirementsKHR(device->vk_device, &buffer_requirement_info, &memory_requirements));
+    VK_CALL(vkGetDeviceBufferMemoryRequirements(device->vk_device, &buffer_requirement_info, &memory_requirements));
     buffer_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
 
     memset(&image_info, 0, sizeof(image_info));
@@ -7300,7 +7299,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
+    VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &image_requirement_info, &memory_requirements));
     sampled_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
 
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -7312,7 +7311,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
             VK_IMAGE_USAGE_SAMPLED_BIT |
             VK_IMAGE_USAGE_STORAGE_BIT;
 
-    VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
+    VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &image_requirement_info, &memory_requirements));
     rt_ds_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
 
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -7323,7 +7322,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
             VK_IMAGE_USAGE_SAMPLED_BIT;
 
-    VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &image_requirement_info, &memory_requirements));
+    VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &image_requirement_info, &memory_requirements));
     rt_ds_type_mask &= memory_requirements.memoryRequirements.memoryTypeBits;
 
     info->non_cpu_accessible_domain.buffer_type_mask = buffer_type_mask;
@@ -7366,7 +7365,7 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
         return S_OK;
 
     vk_usage_flags = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
     /* If push descriptors require extra backing storage, we need to let the driver reserve magic push space for it. */
     if (!device->device_info.descriptor_buffer_properties.bufferlessPushDescriptors)
@@ -7394,7 +7393,7 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
     global_descriptor_buffer->resource.usage = vk_usage_flags;
 
     vk_usage_flags = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     if (FAILED(hr = vkd3d_create_buffer_explicit_usage(device, vk_usage_flags,
             4 * 1024, &global_descriptor_buffer->sampler.vk_buffer)))
     {

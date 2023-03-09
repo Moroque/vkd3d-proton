@@ -222,9 +222,9 @@ static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_trans
         uint64_t wait_value, uint64_t timeout)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    uint64_t old_value, new_value = 0;
     VkSemaphoreWaitInfo wait_info;
-    uint64_t old_value, new_value;
-    VkResult vr;
+    VkResult vr = VK_TIMEOUT;
 
     old_value = vkd3d_atomic_uint64_load_explicit(&queue->last_known_value, vkd3d_memory_order_acquire);
 
@@ -233,19 +233,21 @@ static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_trans
 
     if (timeout)
     {
-        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR;
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
         wait_info.pNext = NULL;
         wait_info.flags = 0;
         wait_info.semaphoreCount = 1;
         wait_info.pSemaphores = &queue->vk_semaphore;
         wait_info.pValues = &wait_value;
 
-        vr = VK_CALL(vkWaitSemaphoresKHR(queue->device->vk_device, &wait_info, timeout));
-        new_value = wait_value;
+        vr = VK_CALL(vkWaitSemaphores(queue->device->vk_device, &wait_info, timeout));
+        if (vr == VK_SUCCESS)
+            new_value = wait_value;
     }
-    else
+
+    if (vr != VK_SUCCESS)
     {
-        vr = VK_CALL(vkGetSemaphoreCounterValueKHR(queue->device->vk_device,
+        vr = VK_CALL(vkGetSemaphoreCounterValue(queue->device->vk_device,
                 queue->vk_semaphore, &new_value));
     }
 
@@ -274,9 +276,9 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
     const VkPipelineStageFlags vk_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
     const struct vkd3d_subresource_layout *subresource_layout;
-    VkTimelineSemaphoreSubmitInfoKHR timeline_info;
     VkCopyBufferToImageInfo2 buffer_to_image_copy;
     struct vkd3d_queue_family_info *queue_family;
+    VkTimelineSemaphoreSubmitInfo timeline_info;
     struct vkd3d_format_footprint footprint;
     VkCommandBufferBeginInfo begin_info;
     VkImageMemoryBarrier image_barrier;
@@ -384,7 +386,7 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
                 buffer_to_image_copy.regionCount = 1;
                 buffer_to_image_copy.pRegions = &copy_region;
 
-                VK_CALL(vkCmdCopyBufferToImage2KHR(vk_cmd_buffer, &buffer_to_image_copy));
+                VK_CALL(vkCmdCopyBufferToImage2(vk_cmd_buffer, &buffer_to_image_copy));
 
                 vkd3d_memory_transfer_queue_track_resource_locked(queue,
                         transfer->resource, queue->next_signal_value);
@@ -403,7 +405,7 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
         return E_FAIL;
 
     memset(&timeline_info, 0, sizeof(timeline_info));
-    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR;
+    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     timeline_info.signalSemaphoreValueCount = 1;
     timeline_info.pSignalSemaphoreValues = &queue->next_signal_value;
 
@@ -428,7 +430,7 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
 
     /* Stall future submissions on other queues until the clear has finished */
     memset(&timeline_info, 0, sizeof(timeline_info));
-    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR;
+    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     timeline_info.waitSemaphoreValueCount = 1;
     timeline_info.pWaitSemaphoreValues = &queue->next_signal_value;
 
@@ -1122,7 +1124,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     if (allocation->resource.vk_buffer)
     {
         allocation->flags |= VKD3D_ALLOCATION_FLAG_GPU_ADDRESS;
-        flags_info.flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT_KHR;
+        flags_info.flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     }
 
     allocation->resource.size = info->memory_requirements.size;
@@ -1195,7 +1197,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
         bind_info.memory = allocation->device_allocation.vk_memory;
         bind_info.memoryOffset = 0;
 
-        if ((vr = VK_CALL(vkBindBufferMemory2KHR(device->vk_device, 1, &bind_info))) < 0)
+        if ((vr = VK_CALL(vkBindBufferMemory2(device->vk_device, 1, &bind_info))) < 0)
         {
             ERR("Failed to bind buffer memory, vr %d.\n", vr);
             vkd3d_memory_allocation_free(allocation, device, allocator);
@@ -1664,7 +1666,7 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
      * RADV definitely does this, and it seems like NV also does it.
      * TODO: an extension for this would be nice. */
     implementation_implicitly_clears =
-            vkd3d_driver_implicitly_clears(device->device_info.driver_properties.driverID) &&
+            vkd3d_driver_implicitly_clears(device->device_info.vulkan_1_2_properties.driverID) &&
             !suballocate;
 
     needs_clear = !implementation_implicitly_clears &&
@@ -1772,7 +1774,7 @@ HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuf
 
     flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
     flags_info.pNext = NULL;
-    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT_KHR;
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
     VK_CALL(vkGetBufferMemoryRequirements(device->vk_device, vk_buffer, &memory_requirements));
 
@@ -1788,7 +1790,7 @@ HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuf
     bind_info.memory = allocation->vk_memory;
     bind_info.memoryOffset = 0;
 
-    if (FAILED(vr = VK_CALL(vkBindBufferMemory2KHR(device->vk_device, 1, &bind_info))))
+    if (FAILED(vr = VK_CALL(vkBindBufferMemory2(device->vk_device, 1, &bind_info))))
         return hresult_from_vk_result(vr);
 
     return hr;

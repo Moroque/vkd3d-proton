@@ -109,69 +109,37 @@ struct vkd3d_vulkan_info
     bool EXT_debug_utils;
 
     /* KHR device extensions */
-    bool KHR_buffer_device_address;
-    bool KHR_draw_indirect_count;
-    bool KHR_image_format_list;
     bool KHR_push_descriptor;
-    bool KHR_timeline_semaphore;
-    bool KHR_shader_float16_int8;
-    bool KHR_shader_subgroup_extended_types;
     bool KHR_ray_tracing_pipeline;
     bool KHR_acceleration_structure;
     bool KHR_deferred_host_operations;
     bool KHR_pipeline_library;
     bool KHR_ray_query;
-    bool KHR_spirv_1_4;
-    bool KHR_shader_float_controls;
     bool KHR_fragment_shading_rate;
-    bool KHR_create_renderpass2;
-    bool KHR_sampler_mirror_clamp_to_edge;
-    bool KHR_separate_depth_stencil_layouts;
-    bool KHR_shader_integer_dot_product;
-    bool KHR_format_feature_flags2;
-    bool KHR_shader_atomic_int64;
-    bool KHR_bind_memory2;
-    bool KHR_copy_commands2;
-    bool KHR_dynamic_rendering;
-    bool KHR_depth_stencil_resolve;
-    bool KHR_driver_properties;
-    bool KHR_uniform_buffer_standard_layout;
-    bool KHR_maintenance4;
     bool KHR_ray_tracing_maintenance1;
     bool KHR_fragment_shader_barycentric;
     bool KHR_external_memory_win32;
     bool KHR_external_semaphore_win32;
     bool KHR_present_wait;
     bool KHR_present_id;
-    bool KHR_synchronization2;
     /* EXT device extensions */
     bool EXT_calibrated_timestamps;
     bool EXT_conditional_rendering;
     bool EXT_conservative_rasterization;
     bool EXT_custom_border_color;
     bool EXT_depth_clip_enable;
-    bool EXT_descriptor_indexing;
     bool EXT_image_view_min_lod;
     bool EXT_robustness2;
-    bool EXT_sampler_filter_minmax;
-    bool EXT_shader_demote_to_helper_invocation;
     bool EXT_shader_stencil_export;
     bool EXT_shader_viewport_index_layer;
-    bool EXT_subgroup_size_control;
-    bool EXT_texel_buffer_alignment;
     bool EXT_transform_feedback;
     bool EXT_vertex_attribute_divisor;
-    bool EXT_extended_dynamic_state;
     bool EXT_extended_dynamic_state2;
     bool EXT_external_memory_host;
-    bool EXT_4444_formats;
     bool EXT_shader_image_atomic_int64;
-    bool EXT_scalar_block_layout;
-    bool EXT_pipeline_creation_feedback;
     bool EXT_mesh_shader;
     bool EXT_mutable_descriptor_type; /* EXT promotion of VALVE one. */
     bool EXT_hdr_metadata;
-    bool EXT_pipeline_creation_cache_control;
     bool EXT_shader_module_identifier;
     bool EXT_descriptor_buffer;
     bool EXT_pipeline_library_group_handles;
@@ -203,8 +171,6 @@ struct vkd3d_vulkan_info
 
     VkPhysicalDeviceLimits device_limits;
     VkPhysicalDeviceSparseProperties sparse_properties;
-
-    VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_buffer_alignment_properties;
 
     unsigned int shader_extension_count;
     enum vkd3d_shader_target_extension shader_extensions[VKD3D_SHADER_TARGET_EXTENSION_COUNT];
@@ -2368,9 +2334,9 @@ enum vkd3d_rendering_flags
 
 struct vkd3d_rendering_info
 {
-    VkRenderingInfoKHR info;
-    VkRenderingAttachmentInfoKHR rtv[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
-    VkRenderingAttachmentInfoKHR dsv;
+    VkRenderingInfo info;
+    VkRenderingAttachmentInfo rtv[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    VkRenderingAttachmentInfo dsv;
     VkRenderingFragmentShadingRateAttachmentInfoKHR vrs;
     uint32_t state_flags;
     uint32_t rtv_mask;
@@ -2417,8 +2383,8 @@ struct vkd3d_image_copy_info
     enum vkd3d_batch_type batch_type;
     union
     {
-        VkBufferImageCopy2KHR buffer_image;
-        VkImageCopy2KHR image;
+        VkBufferImageCopy2 buffer_image;
+        VkImageCopy2 image;
     } copy;
     /* TODO: split d3d12_command_list_copy_image too, so this can be a local variable of before_copy_texture_region. */
     bool writes_full_subresource;
@@ -3283,19 +3249,15 @@ static inline void vkd3d_breadcrumb_buffer_copy(
 /* Bindless */
 enum vkd3d_bindless_flags
 {
-    VKD3D_BINDLESS_SAMPLER               = (1u << 0),
-    VKD3D_BINDLESS_CBV                   = (1u << 1),
-    VKD3D_BINDLESS_SRV                   = (1u << 2),
-    VKD3D_BINDLESS_UAV                   = (1u << 3),
-    VKD3D_BINDLESS_CBV_AS_SSBO           = (1u << 4),
-    VKD3D_BINDLESS_RAW_SSBO              = (1u << 5),
-    VKD3D_SSBO_OFFSET_BUFFER             = (1u << 6),
-    VKD3D_TYPED_OFFSET_BUFFER            = (1u << 7),
-    VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV     = (1u << 8),
-    VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV = (1u << 9),
-    VKD3D_BINDLESS_MUTABLE_TYPE          = (1u << 10),
-    VKD3D_HOIST_STATIC_TABLE_CBV         = (1u << 11),
-    VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO = (1u << 12),
+    VKD3D_BINDLESS_CBV_AS_SSBO           = (1u << 0),
+    VKD3D_BINDLESS_RAW_SSBO              = (1u << 1),
+    VKD3D_SSBO_OFFSET_BUFFER             = (1u << 2),
+    VKD3D_TYPED_OFFSET_BUFFER            = (1u << 3),
+    VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV     = (1u << 4),
+    VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV = (1u << 5),
+    VKD3D_BINDLESS_MUTABLE_TYPE          = (1u << 6),
+    VKD3D_HOIST_STATIC_TABLE_CBV         = (1u << 7),
+    VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO = (1u << 8),
 };
 
 #define VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS 8
@@ -3749,30 +3711,22 @@ enum vkd3d_time_domain_flag
 struct vkd3d_physical_device_info
 {
     /* properties */
-    VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptor_indexing_properties;
+    VkPhysicalDeviceVulkan11Properties vulkan_1_1_properties;
+    VkPhysicalDeviceVulkan12Properties vulkan_1_2_properties;
+    VkPhysicalDeviceVulkan13Properties vulkan_1_3_properties;
     VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor_properties;
-    VkPhysicalDeviceMaintenance3Properties maintenance3_properties;
-    VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_buffer_alignment_properties;
     VkPhysicalDeviceTransformFeedbackPropertiesEXT xfb_properties;
     VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vertex_divisor_properties;
-    VkPhysicalDeviceSubgroupProperties subgroup_properties;
-    VkPhysicalDeviceTimelineSemaphorePropertiesKHR timeline_semaphore_properties;
-    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_properties;
     VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color_properties;
     VkPhysicalDeviceShaderCorePropertiesAMD shader_core_properties;
     VkPhysicalDeviceShaderCoreProperties2AMD shader_core_properties2;
     VkPhysicalDeviceShaderSMBuiltinsPropertiesNV shader_sm_builtins_properties;
-    VkPhysicalDeviceSamplerFilterMinmaxPropertiesEXT sampler_filter_minmax_properties;
     VkPhysicalDeviceRobustness2PropertiesEXT robustness2_properties;
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT external_memory_host_properties;
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR ray_tracing_pipeline_properties;
     VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties;
-    VkPhysicalDeviceFloatControlsPropertiesKHR float_control_properties;
     VkPhysicalDeviceFragmentShadingRatePropertiesKHR fragment_shading_rate_properties;
     VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative_rasterization_properties;
-    VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_properties;
-    VkPhysicalDeviceDriverPropertiesKHR driver_properties;
-    VkPhysicalDeviceMaintenance4PropertiesKHR maintenance4_properties;
     VkPhysicalDeviceDeviceGeneratedCommandsPropertiesNV device_generated_commands_properties_nv;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties;
     VkPhysicalDeviceShaderModuleIdentifierPropertiesEXT shader_module_identifier_properties;
@@ -3781,48 +3735,31 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceProperties2KHR properties2;
 
     /* features */
-    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR buffer_device_address_features;
+    VkPhysicalDeviceVulkan11Features vulkan_1_1_features;
+    VkPhysicalDeviceVulkan12Features vulkan_1_2_features;
+    VkPhysicalDeviceVulkan13Features vulkan_1_3_features;
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_features;
-    VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_indexing_features;
-    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT demote_features;
-    VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT texel_buffer_alignment_features;
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb_features;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vertex_divisor_features;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color_features;
-    VkPhysicalDevice4444FormatsFeaturesEXT ext_4444_formats_features;
-    VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_semaphore_features;
-    VkPhysicalDeviceFloat16Int8FeaturesKHR float16_int8_features;
-    VkPhysicalDevice16BitStorageFeatures storage_16bit_features;
-    VkPhysicalDeviceShaderSubgroupExtendedTypesFeaturesKHR subgroup_extended_types_features;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2_features;
-    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features;
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features;
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutable_descriptor_features;
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR ray_tracing_pipeline_features;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure_features;
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragment_shading_rate_features;
-    VkPhysicalDeviceShaderDrawParametersFeatures shader_draw_parameters_features;
-    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control_features;
-    VkPhysicalDeviceSeparateDepthStencilLayoutsFeaturesKHR separate_depth_stencil_layout_features;
-    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR shader_integer_dot_product_features;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesNV barycentric_features_nv;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric_features_khr;
     VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
     VkPhysicalDeviceComputeShaderDerivativesFeaturesNV compute_shader_derivatives_features_nv;
-    VkPhysicalDeviceShaderAtomicInt64FeaturesKHR shader_atomic_int64_features;
     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT shader_image_atomic_int64_features;
-    VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalar_block_layout_features;
-    VkPhysicalDeviceUniformBufferStandardLayoutFeatures uniform_buffer_standard_layout_features;
     VkPhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod_features;
     VkPhysicalDeviceDescriptorSetHostMappingFeaturesVALVE descriptor_set_host_mapping_features;
-    VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_features;
     VkPhysicalDeviceCoherentMemoryFeaturesAMD device_coherent_memory_features_amd;
-    VkPhysicalDeviceMaintenance4FeaturesKHR maintenance4_features;
     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR ray_tracing_maintenance1_features;
     VkPhysicalDeviceDeviceGeneratedCommandsFeaturesNV device_generated_commands_features_nv;
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features;
-    VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT pipeline_creation_cache_control_features;
     VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT shader_module_identifier_features;
     VkPhysicalDevicePresentIdFeaturesKHR present_id_features;
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features;
