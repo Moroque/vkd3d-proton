@@ -1525,7 +1525,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_QueryInterface(d3d12_resource_if
             || IsEqualGUID(riid, &IID_ID3D12Object)
             || IsEqualGUID(riid, &IID_IUnknown))
     {
-        ID3D12Resource_AddRef(iface);
+        ID3D12Resource2_AddRef(iface);
         *object = iface;
         return S_OK;
     }
@@ -3556,6 +3556,7 @@ void d3d12_desc_copy(vkd3d_cpu_descriptor_va_t dst_va, vkd3d_cpu_descriptor_va_t
         unsigned int count, D3D12_DESCRIPTOR_HEAP_TYPE heap_type, struct d3d12_device *device)
 {
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    if (!d3d12_device_use_embedded_mutable_descriptors(device))
     {
         struct d3d12_desc_split dst, src;
         unsigned int i;

@@ -164,6 +164,9 @@ struct vkd3d_vulkan_info
     bool VALVE_mutable_descriptor_type;
     bool VALVE_descriptor_set_host_mapping;
 
+    unsigned int extension_count;
+    const char* const* extension_names;
+
     bool rasterization_stream;
     bool transform_feedback_queries;
 
@@ -982,6 +985,8 @@ VkImageSubresource vk_image_subresource_from_d3d12(
         const struct vkd3d_format *format, uint32_t subresource_idx,
         unsigned int miplevel_count, unsigned int layer_count,
         bool all_aspects);
+VkImageLayout vk_image_layout_from_d3d12_resource_state(
+        struct d3d12_command_list *list, const struct d3d12_resource *resource, D3D12_RESOURCE_STATES state);
 UINT d3d12_plane_index_from_vk_aspect(VkImageAspectFlagBits aspect);
 
 HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
@@ -1598,6 +1603,9 @@ struct d3d12_bind_point_layout
 {
     VkPipelineLayout vk_pipeline_layout;
     VkShaderStageFlags vk_push_stages;
+    unsigned int flags; /* vkd3d_root_signature_flag */
+    uint32_t num_set_layouts;
+    VkPushConstantRange push_constant_range;
 };
 
 #define VKD3D_MAX_HOISTED_DESCRIPTORS 16
@@ -1641,7 +1649,6 @@ struct d3d12_root_signature
     uint64_t root_descriptor_push_mask;
 
     D3D12_ROOT_SIGNATURE_FLAGS d3d12_flags;
-    unsigned int flags; /* vkd3d_root_signature_flag */
 
     unsigned int binding_count;
     struct vkd3d_shader_resource_binding *bindings;
@@ -1649,8 +1656,6 @@ struct d3d12_root_signature
     unsigned int root_constant_count;
     struct vkd3d_shader_push_constant_buffer *root_constants;
 
-    /* Use one global push constant range */
-    VkPushConstantRange push_constant_range;
     struct vkd3d_shader_descriptor_binding push_constant_ubo_binding;
     struct vkd3d_shader_descriptor_binding raw_va_aux_buffer_binding;
     struct vkd3d_shader_descriptor_binding offset_buffer_binding;
@@ -1660,7 +1665,6 @@ struct d3d12_root_signature
 #endif
 
     VkDescriptorSetLayout set_layouts[VKD3D_MAX_DESCRIPTOR_SETS];
-    uint32_t num_set_layouts;
 
     uint32_t descriptor_table_offset;
     uint32_t descriptor_table_count;
@@ -1695,7 +1699,8 @@ static inline struct d3d12_root_signature *impl_from_ID3D12RootSignature(ID3D12R
     return CONTAINING_RECORD(iface, struct d3d12_root_signature, ID3D12RootSignature_iface);
 }
 
-unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_root_signature *root_signature);
+unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_root_signature *root_signature,
+        enum vkd3d_pipeline_type pipeline_type);
 HRESULT d3d12_root_signature_create_local_static_samplers_layout(struct d3d12_root_signature *root_signature,
         VkDescriptorSetLayout vk_set_layout, VkPipelineLayout *vk_pipeline_layout);
 HRESULT vkd3d_create_pipeline_layout(struct d3d12_device *device,
@@ -2594,6 +2599,7 @@ struct d3d12_command_list
     {
         bool has_observed_transition_to_indirect;
         bool has_emitted_indirect_to_compute_barrier;
+        bool has_emitted_indirect_to_compute_cbv_barrier;
     } execute_indirect;
 
     VkCommandBuffer vk_command_buffer;
@@ -2977,14 +2983,22 @@ struct d3d12_command_signature
     uint32_t argument_buffer_offset;
 
     /* Complex command signatures require some work to stamp out device generated commands. */
-    struct
+    union
     {
-        VkBuffer buffer;
-        VkDeviceAddress buffer_va;
-        struct vkd3d_device_memory_allocation memory;
-        VkIndirectCommandsLayoutNV layout;
-        uint32_t stride;
-        struct vkd3d_execute_indirect_info pipeline;
+        struct
+        {
+            VkBuffer buffer;
+            VkDeviceAddress buffer_va;
+            struct vkd3d_device_memory_allocation memory;
+            VkIndirectCommandsLayoutNV layout;
+            uint32_t stride;
+            struct vkd3d_execute_indirect_info pipeline;
+        } graphics;
+        struct
+        {
+            int32_t source_offsets[D3D12_MAX_ROOT_COST];
+            uint32_t dispatch_offset_words;
+        } compute;
     } state_template;
     bool requires_state_template;
     enum vkd3d_pipeline_type pipeline_type;
@@ -3110,6 +3124,9 @@ enum vkd3d_breadcrumb_command_type
     VKD3D_BREADCRUMB_COMMAND_DISCARD,
     VKD3D_BREADCRUMB_COMMAND_CLEAR_INLINE,
     VKD3D_BREADCRUMB_COMMAND_CLEAR_PASS,
+    VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_PATCH_COMPUTE,
+    VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_PATCH_STATE_COMPUTE,
+    VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_UNROLL_COMPUTE,
 };
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -3369,6 +3386,7 @@ enum vkd3d_bindless_flags
     VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO            = (1u << 8),
     VKD3D_BINDLESS_MUTABLE_EMBEDDED                 = (1u << 9),
     VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA = (1u << 10),
+    VKD3D_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO    = (1u << 11),
 };
 
 #define VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS 8
@@ -3733,6 +3751,45 @@ HRESULT vkd3d_predicate_ops_init(struct vkd3d_predicate_ops *meta_predicate_ops,
 void vkd3d_predicate_ops_cleanup(struct vkd3d_predicate_ops *meta_predicate_ops,
         struct d3d12_device *device);
 
+struct vkd3d_multi_dispatch_indirect_info
+{
+    VkPipelineLayout vk_pipeline_layout;
+    VkPipeline vk_pipeline;
+};
+
+struct vkd3d_multi_dispatch_indirect_args
+{
+    VkDeviceAddress indirect_va;
+    VkDeviceAddress count_va;
+    VkDeviceAddress output_va;
+    uint32_t stride_words;
+    uint32_t max_commands;
+};
+
+struct vkd3d_multi_dispatch_indirect_state_args
+{
+    VkDeviceAddress indirect_va;
+    VkDeviceAddress count_va;
+    VkDeviceAddress dispatch_va;
+    VkDeviceAddress root_parameters_va;
+    VkDeviceAddress root_parameter_template_va;
+    uint32_t stride_words;
+    uint32_t dispatch_offset_words;
+};
+
+struct vkd3d_multi_dispatch_indirect_ops
+{
+    VkPipelineLayout vk_multi_dispatch_indirect_layout;
+    VkPipelineLayout vk_multi_dispatch_indirect_state_layout;
+    VkPipeline vk_multi_dispatch_indirect_pipeline;
+    VkPipeline vk_multi_dispatch_indirect_state_pipeline;
+};
+
+HRESULT vkd3d_multi_dispatch_indirect_ops_init(struct vkd3d_multi_dispatch_indirect_ops *meta_predicate_ops,
+        struct d3d12_device *device);
+void vkd3d_multi_dispatch_indirect_ops_cleanup(struct vkd3d_multi_dispatch_indirect_ops *meta_predicate_ops,
+        struct d3d12_device *device);
+
 struct vkd3d_execute_indirect_args
 {
     VkDeviceAddress template_va;
@@ -3784,6 +3841,7 @@ struct vkd3d_meta_ops
     struct vkd3d_query_ops query;
     struct vkd3d_predicate_ops predicate;
     struct vkd3d_execute_indirect_ops execute_indirect;
+    struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
 };
 
 HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device);
@@ -3815,6 +3873,16 @@ bool vkd3d_meta_get_query_gather_pipeline(struct vkd3d_meta_ops *meta_ops,
 
 void vkd3d_meta_get_predicate_pipeline(struct vkd3d_meta_ops *meta_ops,
         enum vkd3d_predicate_command_type command_type, struct vkd3d_predicate_command_info *info);
+
+void vkd3d_meta_get_multi_dispatch_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_multi_dispatch_indirect_info *info);
+void vkd3d_meta_get_multi_dispatch_indirect_state_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_multi_dispatch_indirect_info *info);
+
+static inline uint32_t vkd3d_meta_get_multi_dispatch_indirect_workgroup_size(void)
+{
+    return 32;
+}
 
 HRESULT vkd3d_meta_get_execute_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
         uint32_t patch_command_count, struct vkd3d_execute_indirect_info *info);
@@ -3950,6 +4018,9 @@ struct vkd3d_descriptor_qa_heap_buffer_data;
 /* ID3D12DeviceExt */
 typedef ID3D12DeviceExt d3d12_device_vkd3d_ext_iface;
 
+/* ID3D12DXVKInteropDevice */
+typedef ID3D12DXVKInteropDevice d3d12_dxvk_interop_device_iface;
+
 struct d3d12_device_scratch_pool
 {
     struct vkd3d_scratch_buffer scratch_buffers[VKD3D_SCRATCH_BUFFER_COUNT];
@@ -3960,6 +4031,7 @@ struct d3d12_device
 {
     d3d12_device_iface ID3D12Device_iface;
     d3d12_device_vkd3d_ext_iface ID3D12DeviceExt_iface;
+    d3d12_dxvk_interop_device_iface ID3D12DXVKInteropDevice_iface;
     LONG refcount;
 
     VkDevice vk_device;
