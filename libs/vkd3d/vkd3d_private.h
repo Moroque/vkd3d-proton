@@ -636,6 +636,7 @@ struct vkd3d_allocate_memory_info
     void *host_ptr;
     const void *pNext;
     uint32_t flags;
+    VkBufferUsageFlags explicit_global_buffer_usage;
     VkMemoryPropertyFlags optional_memory_properties;
 };
 
@@ -690,6 +691,7 @@ struct vkd3d_memory_allocation
     D3D12_HEAP_TYPE heap_type;
     D3D12_HEAP_FLAGS heap_flags;
     uint32_t flags;
+    VkBufferUsageFlags explicit_global_buffer_usage;
 
     uint64_t clear_semaphore_value;
 
@@ -796,6 +798,8 @@ void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocato
         const struct vkd3d_memory_allocation *allocation);
 HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
         const struct vkd3d_allocate_memory_info *info, struct vkd3d_memory_allocation *allocation);
+bool vkd3d_allocate_image_memory_prefers_dedicated(struct d3d12_device *device,
+        D3D12_HEAP_FLAGS heap_flags, const VkMemoryRequirements *requirements);
 HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
         const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation);
 

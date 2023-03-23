@@ -2045,7 +2045,6 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
     physical_device_info->vulkan_1_2_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
     physical_device_info->vulkan_1_2_features.bufferDeviceAddressMultiDevice = VK_FALSE;
     physical_device_info->vulkan_1_2_features.imagelessFramebuffer = VK_FALSE;
-    physical_device_info->vulkan_1_2_features.vulkanMemoryModelDeviceScope = VK_FALSE;
     physical_device_info->vulkan_1_2_features.vulkanMemoryModelAvailabilityVisibilityChains = VK_FALSE;
 
     physical_device_info->vulkan_1_3_features.robustImageAccess = VK_FALSE;
@@ -7237,6 +7236,8 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         pthread_mutex_unlock(&d3d12_device_map_mutex);
         return E_OUTOFMEMORY;
     }
+
+    memset(object, 0, sizeof(*object));
 
     if (FAILED(hr = d3d12_device_init(object, instance, create_info)))
     {
