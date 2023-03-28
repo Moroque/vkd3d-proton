@@ -113,6 +113,17 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
 
     memset(object, 0, sizeof(*object));
 
+    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS))
+    {
+        if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
+        {
+            /* There appears to be a race condition in the driver when submitting concurrently
+             * to different VkQueues. Spec allows it, but there are likely dragons lurking ... */
+            WARN("Enabling global submission mutex workaround.\n");
+            object->global_mutex = &device->global_submission_mutex;
+        }
+    }
+
     if ((rc = pthread_mutex_init(&object->mutex, NULL)))
     {
         ERR("Failed to initialize mutex, error %d.\n", rc);
@@ -193,13 +204,6 @@ static void vkd3d_queue_flush_waiters(struct vkd3d_queue *vkd3d_queue,
 void vkd3d_queue_destroy(struct vkd3d_queue *queue, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    int rc;
-
-    if ((rc = pthread_mutex_lock(&queue->mutex)))
-        ERR("Failed to lock mutex, error %d.\n", rc);
-
-    if (!rc)
-        pthread_mutex_unlock(&queue->mutex);
 
     /* Also waits for queue idle when we don't pass in a worker. */
     vkd3d_queue_flush_waiters(queue, NULL, vk_procs);
@@ -228,6 +232,13 @@ VkQueue vkd3d_queue_acquire(struct vkd3d_queue *queue)
         return VK_NULL_HANDLE;
     }
 
+    if (queue->global_mutex && (rc = pthread_mutex_lock(queue->global_mutex)))
+    {
+        ERR("Failed to lock mutex, error %d.\n", rc);
+        pthread_mutex_unlock(&queue->mutex);
+        return VK_NULL_HANDLE;
+    }
+
     assert(queue->vk_queue);
     return queue->vk_queue;
 }
@@ -235,7 +246,8 @@ VkQueue vkd3d_queue_acquire(struct vkd3d_queue *queue)
 void vkd3d_queue_release(struct vkd3d_queue *queue)
 {
     TRACE("queue %p.\n", queue);
-
+    if (queue->global_mutex)
+        pthread_mutex_unlock(queue->global_mutex);
     pthread_mutex_unlock(&queue->mutex);
 }
 

@@ -1321,6 +1321,10 @@ struct d3d12_descriptor_heap_set
 
 struct d3d12_descriptor_heap
 {
+    /* Used by special optimizations where we can take advantage of knowledge of the binding model
+     * without awkward lookups. Optimized vtable overrides define what these pointers mean. */
+    void *fast_pointer_bank[3];
+
     ID3D12DescriptorHeap ID3D12DescriptorHeap_iface;
     LONG refcount;
 
@@ -2777,6 +2781,9 @@ struct vkd3d_queue
     /* Access to VkQueue must be externally synchronized. */
     pthread_mutex_t mutex;
 
+    /* If not NULL, lock a shared mutex as well. */
+    pthread_mutex_t *global_mutex;
+
     VkQueue vk_queue;
 
     VkCommandPool barrier_pool;
@@ -4044,6 +4051,7 @@ struct d3d12_device
     struct vkd3d_vk_device_procs vk_procs;
 
     pthread_mutex_t mutex;
+    pthread_mutex_t global_submission_mutex;
 
     VkPhysicalDeviceMemoryProperties memory_properties;
 
