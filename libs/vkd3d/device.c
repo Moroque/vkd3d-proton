@@ -513,10 +513,18 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Spider-Man.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
     /* Marvel’s Spider-Man: Miles Morales (1817190) */
     { VKD3D_STRING_COMPARE_EXACT, "MilesMorales.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
+    /* Deus Ex: Mankind United (337000) */
+    { VKD3D_STRING_COMPARE_EXACT, "DXMD.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
     /* Dead Space (2023) (1693980) */
     { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_FORCE_DEDICATED_IMAGE_ALLOCATION, 0 },
     /* Witcher 3 (2023) (292030) */
     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION, 0 },
+    /* The Last of Us - Part 1 (1888930) */
+    { VKD3D_STRING_COMPARE_EXACT, "tlou-i.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    { VKD3D_STRING_COMPARE_EXACT, "tlou-i-l.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    /* Uncharted: Legacy of Thieves Collection (1659420) */
+    { VKD3D_STRING_COMPARE_EXACT, "u4.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    { VKD3D_STRING_COMPARE_EXACT, "tll.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -594,6 +602,8 @@ static void vkd3d_instance_apply_application_workarounds(void)
     size_t i;
     if (!vkd3d_get_program_name(app))
         return;
+
+    INFO("Program name: \"%s\"\n", app);
 
     for (i = 0; i < ARRAY_SIZE(application_override); i++)
     {
@@ -763,6 +773,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"breadcrumbs_trace", VKD3D_CONFIG_FLAG_BREADCRUMBS | VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE},
     {"force_compute_root_parameters_push_ubo", VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO},
     {"skip_driver_workarounds", VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS},
+    {"curb_memory_pso_cache", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -6663,6 +6674,53 @@ static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
     TRACE("Max feature level: %#x.\n", caps->max_feature_level);
 }
 
+static void d3d12_device_caps_shader_model_override(struct d3d12_device *device)
+{
+    D3D_SHADER_MODEL sm_override = (D3D_SHADER_MODEL)0;
+    char sm_string[VKD3D_PATH_MAX];
+    unsigned int i;
+
+    static const struct
+    {
+        const char *string;
+        D3D_SHADER_MODEL shader_model;
+    }
+    shader_models[] =
+    {
+        { "5_1", D3D_SHADER_MODEL_5_1 },
+        { "6_0", D3D_SHADER_MODEL_6_0 },
+        { "6_1", D3D_SHADER_MODEL_6_1 },
+        { "6_2", D3D_SHADER_MODEL_6_2 },
+        { "6_3", D3D_SHADER_MODEL_6_3 },
+        { "6_4", D3D_SHADER_MODEL_6_4 },
+        { "6_5", D3D_SHADER_MODEL_6_5 },
+        { "6_6", D3D_SHADER_MODEL_6_6 },
+        { "6_7", D3D_SHADER_MODEL_6_7 },
+    };
+
+    if (!vkd3d_get_env_var("VKD3D_SHADER_MODEL", sm_string, sizeof(sm_string)))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(shader_models); i++)
+    {
+        if (!strcmp(sm_string, shader_models[i].string))
+        {
+            sm_override = shader_models[i].shader_model;
+            break;
+        }
+    }
+
+    if (!sm_override)
+    {
+        WARN("Unrecognized shader model %s.\n", sm_string);
+    }
+    else
+    {
+        device->d3d12_caps.max_shader_model = sm_override;
+        WARN("Overriding supported shader model: %s.\n", sm_string);
+    }
+}
+
 static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
 {
     const struct vkd3d_physical_device_info *physical_device_info = &device->device_info;
@@ -6816,7 +6874,7 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
 
     static const struct
     {
-        const char* string;
+        const char *string;
         D3D_FEATURE_LEVEL feature_level;
     }
     feature_levels[] =
@@ -6896,6 +6954,7 @@ static void d3d12_device_caps_init(struct d3d12_device *device)
     d3d12_device_caps_init_feature_options11(device);
     d3d12_device_caps_init_feature_level(device);
 
+    d3d12_device_caps_shader_model_override(device);
     d3d12_device_caps_override(device);
     d3d12_device_caps_override_application(device);
 }
