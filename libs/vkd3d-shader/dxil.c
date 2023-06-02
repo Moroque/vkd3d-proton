@@ -557,6 +557,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         const struct vkd3d_shader_interface_info *shader_interface_info,
         const struct vkd3d_shader_compile_arguments *compiler_args)
 {
+    dxil_spv_option_denorm_preserve_support denorm_preserve = {{ DXIL_SPV_OPTION_DENORM_PRESERVE_SUPPORT }};
     struct vkd3d_dxil_remap_userdata remap_userdata;
     unsigned int raw_va_binding_count = 0;
     unsigned int num_root_descriptors = 0;
@@ -564,6 +565,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     dxil_spv_converter converter = NULL;
     dxil_spv_parsed_blob blob = NULL;
     dxil_spv_compiled_spirv compiled;
+    unsigned int heuristic_wave_size;
     dxil_spv_shader_stage stage;
     unsigned int i, j, max_size;
     vkd3d_shader_hash_t hash;
@@ -839,6 +841,17 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
                     goto end;
                 }
             }
+            else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE)
+                denorm_preserve.supports_float16_denorm_preserve = DXIL_SPV_TRUE;
+            else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE)
+                denorm_preserve.supports_float64_denorm_preserve = DXIL_SPV_TRUE;
+        }
+
+        if (dxil_spv_converter_add_option(converter, &denorm_preserve.base) != DXIL_SPV_SUCCESS)
+        {
+            ERR("dxil-spirv does not support DENORM_PRESERVE_SUPPORT.\n");
+            ret = VKD3D_ERROR_NOT_IMPLEMENTED;
+            goto end;
         }
 
         if (compiler_args->dual_source_blending)
@@ -965,6 +978,19 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
             &spirv->meta.cs_workgroup_size[2]);
     dxil_spv_converter_get_patch_vertex_count(converter, &spirv->meta.patch_vertex_count);
     dxil_spv_converter_get_compute_required_wave_size(converter, &spirv->meta.cs_required_wave_size);
+
+    if (compiler_args->promote_wave_size_heuristics)
+    {
+        dxil_spv_converter_get_compute_heuristic_max_wave_size(converter, &heuristic_wave_size);
+        if (quirks & VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32)
+            heuristic_wave_size = 32;
+
+        if (heuristic_wave_size && !spirv->meta.cs_required_wave_size &&
+                compiler_args->max_subgroup_size > heuristic_wave_size &&
+                compiler_args->min_subgroup_size <= heuristic_wave_size)
+            spirv->meta.cs_required_wave_size = heuristic_wave_size;
+    }
+
     vkd3d_shader_extract_feature_meta(spirv);
     vkd3d_shader_dump_spirv_shader(hash, spirv);
 
@@ -982,6 +1008,7 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
         const struct vkd3d_shader_interface_local_info *shader_interface_local_info,
         const struct vkd3d_shader_compile_arguments *compiler_args)
 {
+    dxil_spv_option_denorm_preserve_support denorm_preserve = {{ DXIL_SPV_OPTION_DENORM_PRESERVE_SUPPORT }};
     const struct vkd3d_shader_push_constant_buffer *record_constant_buffer;
     const struct vkd3d_shader_resource_binding *resource_binding;
     const struct vkd3d_shader_root_parameter *root_parameter;
@@ -1349,7 +1376,18 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
                     goto end;
                 }
             }
+            else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE)
+                denorm_preserve.supports_float16_denorm_preserve = DXIL_SPV_TRUE;
+            else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE)
+                denorm_preserve.supports_float64_denorm_preserve = DXIL_SPV_TRUE;
         }
+    }
+
+    if (dxil_spv_converter_add_option(converter, &denorm_preserve.base) != DXIL_SPV_SUCCESS)
+    {
+        ERR("dxil-spirv does not support DENORM_PRESERVE_SUPPORT.\n");
+        ret = VKD3D_ERROR_NOT_IMPLEMENTED;
+        goto end;
     }
 
     dxil_spv_converter_set_entry_point(converter, export);
@@ -1556,6 +1594,62 @@ static void vkd3d_shader_dxil_copy_subobject(unsigned int identifier,
             FIXME("Unrecognized RDAT subobject type: %u.\n", dxil_subobject->kind);
             break;
     }
+}
+
+int vkd3d_shader_dxil_find_global_root_signature_subobject(const void *dxbc, size_t size,
+        struct vkd3d_shader_code *code)
+{
+    dxil_spv_parsed_blob blob = NULL;
+    dxil_spv_rdat_subobject rdat;
+    unsigned int i, rdat_count;
+    int found_index = -1;
+    int ret = VKD3D_OK;
+
+    dxil_spv_set_thread_log_callback(vkd3d_dxil_log_callback, NULL);
+    dxil_spv_begin_thread_allocator_context();
+
+    if (dxil_spv_parse_dxil_blob(dxbc, size, &blob) != DXIL_SPV_SUCCESS)
+    {
+        ret = VKD3D_ERROR_INVALID_ARGUMENT;
+        goto end;
+    }
+
+    rdat_count = dxil_spv_parsed_blob_get_num_rdat_subobjects(blob);
+
+    for (i = 0; i < rdat_count; i++)
+    {
+        dxil_spv_parsed_blob_get_rdat_subobject(blob, i, &rdat);
+        if (rdat.kind == DXIL_SPV_RDAT_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE)
+        {
+            if (found_index >= 0)
+            {
+                /* Ambiguous. Must fail. */
+                ret = VKD3D_ERROR_INVALID_ARGUMENT;
+                goto end;
+            }
+
+            found_index = (int)i;
+        }
+    }
+
+    if (found_index < 0)
+    {
+        ret = VKD3D_ERROR_INVALID_ARGUMENT;
+        goto end;
+    }
+
+    dxil_spv_parsed_blob_get_rdat_subobject(blob, found_index, &rdat);
+    memset(code, 0, sizeof(*code));
+
+    /* These point directly to blob. */
+    code->code = rdat.payload;
+    code->size = rdat.payload_size;
+
+end:
+    if (blob)
+        dxil_spv_parsed_blob_free(blob);
+    dxil_spv_end_thread_allocator_context();
+    return ret;
 }
 
 int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(

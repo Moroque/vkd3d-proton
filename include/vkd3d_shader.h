@@ -362,6 +362,8 @@ enum vkd3d_shader_target_extension
     VKD3D_SHADER_TARGET_EXTENSION_ASSUME_PER_COMPONENT_SSBO_ROBUSTNESS,
     VKD3D_SHADER_TARGET_EXTENSION_BARYCENTRIC_KHR,
     VKD3D_SHADER_TARGET_EXTENSION_MIN_PRECISION_IS_NATIVE_16BIT,
+    VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE,
+    VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE,
     VKD3D_SHADER_TARGET_EXTENSION_COUNT,
 };
 
@@ -401,6 +403,10 @@ enum vkd3d_shader_quirk
     /* Force lane count query to return 1.
      * Can be used to disable buggy subgroup logic that checks for subgroup sizes. */
     VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 = (1 << 9),
+
+    /* Enforce a subgroup size of 32 or less. Can be used to work around
+     * issues in shaders that are buggy with large subgroups. */
+    VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32 = (1 << 10),
 };
 
 struct vkd3d_shader_quirk_hash
@@ -433,6 +439,10 @@ struct vkd3d_shader_compile_arguments
     bool dual_source_blending;
     const unsigned int *output_swizzles;
     unsigned int output_swizzle_count;
+
+    uint32_t min_subgroup_size;
+    uint32_t max_subgroup_size;
+    bool promote_wave_size_heuristics;
 
     const struct vkd3d_shader_quirk_info *quirks;
 };
@@ -922,6 +932,9 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
 
 void vkd3d_shader_dxil_free_library_entry_points(struct vkd3d_shader_library_entry_point *entry_points, size_t count);
 void vkd3d_shader_dxil_free_library_subobjects(struct vkd3d_shader_library_subobject *subobjects, size_t count);
+
+int vkd3d_shader_dxil_find_global_root_signature_subobject(const void *dxbc, size_t size,
+        struct vkd3d_shader_code *code);
 
 /* export may be a mangled or demangled name.
  * If RTPSO requests the demangled name, it will likely be demangled, otherwise we forward the mangled name directly.

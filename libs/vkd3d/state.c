@@ -2387,6 +2387,10 @@ static void d3d12_pipeline_state_init_compile_arguments(struct d3d12_pipeline_st
     compile_arguments->target = VKD3D_SHADER_TARGET_SPIRV_VULKAN_1_0;
     compile_arguments->target_extension_count = device->vk_info.shader_extension_count;
     compile_arguments->target_extensions = device->vk_info.shader_extensions;
+    compile_arguments->min_subgroup_size = device->device_info.vulkan_1_3_properties.minSubgroupSize;
+    compile_arguments->max_subgroup_size = device->device_info.vulkan_1_3_properties.maxSubgroupSize;
+    compile_arguments->promote_wave_size_heuristics =
+            d3d12_device_supports_required_subgroup_size_for_stage(device, stage);
     compile_arguments->quirks = &vkd3d_shader_quirk_info;
 
     if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -3496,6 +3500,8 @@ vkd3d_dynamic_state_list[] =
     { VKD3D_DYNAMIC_STATE_FRAGMENT_SHADING_RATE, VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR },
     { VKD3D_DYNAMIC_STATE_PRIMITIVE_RESTART,     VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT },
     { VKD3D_DYNAMIC_STATE_PATCH_CONTROL_POINTS,  VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT },
+    { VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,    VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE },
+    { VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK,    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK },
 };
 
 uint32_t vkd3d_init_dynamic_state_array(VkDynamicState *dynamic_states, uint32_t dynamic_state_flags)
@@ -3772,6 +3778,13 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
 
     if (graphics->ds_desc.depthBoundsTestEnable)
         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_DEPTH_BOUNDS;
+
+    /* If the DSV is read-only for a plane, writes are dynamically disabled. */
+    if (graphics->ds_desc.depthTestEnable && graphics->ds_desc.depthWriteEnable)
+        dynamic_state_flags |= VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
+
+    if (graphics->ds_desc.stencilTestEnable && graphics->ds_desc.front.writeMask)
+        dynamic_state_flags |= VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK;
 
     for (i = 0; i < graphics->rt_count; i++)
     {
@@ -4394,8 +4407,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             case D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA:
                 input_rate = VK_VERTEX_INPUT_RATE_INSTANCE;
                 instance_divisor = e->InstanceDataStepRate;
-                if (instance_divisor > vk_info->max_vertex_attrib_divisor
-                        || (!instance_divisor && !vk_info->vertex_attrib_zero_divisor))
+                if (instance_divisor > vk_info->max_vertex_attrib_divisor)
                 {
                     FIXME("Instance divisor %u not supported by Vulkan implementation.\n", instance_divisor);
                     instance_divisor = 1;
@@ -4819,11 +4831,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     /* Mesa's internal cache can bloat indefinitely, so workaround it as needed for now.
      * TODO: Find a better solution. */
-    if (!object->vk_pso_cache &&
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE) &&
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE) &&
-            !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS) &&
-            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    if (!object->vk_pso_cache && device->device_info.workarounds.force_dummy_pipeline_cache)
     {
         if (vkd3d_create_pipeline_cache(device, 0, NULL, &object->vk_pso_cache) != VK_SUCCESS)
             object->vk_pso_cache = VK_NULL_HANDLE;
@@ -4914,10 +4922,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
     }
 
-    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE) &&
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE) &&
-            !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS) &&
-            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    if (device->device_info.workarounds.force_dummy_pipeline_cache)
     {
         /* Throw the pipeline cache away immediately. Tricks drivers into not retaining the PSO in memory cache. */
         VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
@@ -5772,7 +5777,7 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
     return hresult_from_vk_result(vr);
 }
 
-static uint32_t vkd3d_bindless_get_mutable_descriptor_type_size(struct d3d12_device *device)
+uint32_t vkd3d_bindless_get_mutable_descriptor_type_size(struct d3d12_device *device)
 {
     VkDescriptorType descriptor_types[VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES];
     uint32_t descriptor_type_count, i;
@@ -5811,14 +5816,10 @@ static bool vkd3d_bindless_supports_embedded_packed_metadata(struct d3d12_device
             vkd3d_bindless_get_mutable_descriptor_type_size(device);
 }
 
-static bool vkd3d_bindless_supports_embedded_mutable_type(struct d3d12_device *device, uint32_t flags)
+bool vkd3d_bindless_supports_embedded_mutable_type(struct d3d12_device *device, uint32_t flags)
 {
     const VkPhysicalDeviceDescriptorBufferPropertiesEXT *props = &device->device_info.descriptor_buffer_properties;
     uint32_t max_size;
-
-    if (!device->device_info.mutable_descriptor_features.mutableDescriptorType ||
-            !d3d12_device_uses_descriptor_buffers(device))
-        return false;
 
 #ifdef VKD3D_ENABLE_PROFILING
     /* For now, we don't do vtable variant shenanigans for profiled devices.
@@ -6004,23 +6005,25 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
             flags |= VKD3D_BINDLESS_CBV_AS_SSBO;
     }
 
-    /* Normally, we would be able to use SSBOs conditionally even when maxSSBOAlignment > 4, but
-     * applications (RE2 being one example) are of course buggy and don't match descriptor and shader usage of resources,
-     * so we cannot rely on alignment analysis to select the appropriate resource type. */
-    if ((d3d12_device_uses_descriptor_buffers(device) ||
-            (device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers >= 1000000 &&
-                    device_info->vulkan_1_2_features.descriptorBindingStorageBufferUpdateAfterBind)) &&
-        device_info->properties2.properties.limits.minStorageBufferOffsetAlignment <= 16)
+    /* 16 is the cutoff due to requirements on ByteAddressBuffer.
+     * We need tight 16 byte robustness on those and trying to emulate that with offset buffers
+     * is too much of an ordeal. */
+    if (device_info->properties2.properties.limits.minStorageBufferOffsetAlignment <= 16)
     {
         flags |= VKD3D_BINDLESS_RAW_SSBO;
 
-        /* Intel GPUs have smol descriptor heaps and only way we can fit a D3D12 heap is with
-         * single set mutable. */
-        if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_MUTABLE_SINGLE_SET) ||
-                device_info->properties2.properties.vendorID == VKD3D_VENDOR_ID_INTEL)
+        /* Descriptor buffers do not support SINGLE_SET layout.
+         * We only enable descriptor buffers if we have verified that MUTABLE_SINGLE_SET hack is not required. */
+        if (!d3d12_device_uses_descriptor_buffers(device))
         {
-            INFO("Enabling single descriptor set path for MUTABLE.\n");
-            flags |= VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO;
+            /* Intel GPUs have smol descriptor heaps and only way we can fit a D3D12 heap is with
+             * single set mutable. */
+            if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_MUTABLE_SINGLE_SET) ||
+                    device_info->properties2.properties.vendorID == VKD3D_VENDOR_ID_INTEL)
+            {
+                INFO("Enabling single descriptor set path for MUTABLE.\n");
+                flags |= VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO;
+            }
         }
 
         if (device_info->properties2.properties.limits.minStorageBufferOffsetAlignment > 4)
@@ -6065,7 +6068,8 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
         flags |= VKD3D_BINDLESS_MUTABLE_TYPE;
 
         /* If we can, opt in to extreme speed mode. */
-        if (vkd3d_bindless_supports_embedded_mutable_type(device, flags))
+        if (d3d12_device_uses_descriptor_buffers(device) &&
+                vkd3d_bindless_supports_embedded_mutable_type(device, flags))
         {
             flags |= VKD3D_BINDLESS_MUTABLE_EMBEDDED;
             INFO("Device supports ultra-fast path for descriptor copies.\n");
@@ -6151,8 +6155,19 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
     memset(bindless_state, 0, sizeof(*bindless_state));
     bindless_state->flags = vkd3d_bindless_state_get_bindless_flags(device);
 
+    if (!device_info->vulkan_1_2_features.descriptorIndexing ||
+            /* Some extra features not covered by descriptorIndexing meta-feature. */
+            !device_info->vulkan_1_2_features.shaderStorageTexelBufferArrayNonUniformIndexing ||
+            !device_info->vulkan_1_2_features.shaderStorageImageArrayNonUniformIndexing ||
+            !device_info->vulkan_1_2_features.descriptorBindingVariableDescriptorCount)
+    {
+        ERR("Insufficient descriptor indexing support.\n");
+        goto fail;
+    }
+
     if (!d3d12_device_uses_descriptor_buffers(device))
     {
+        /* UBO is optional. We can fall back to SSBO if required. */
         if (device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindSampledImages < 1000000 ||
                 device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageImages < 1000000 ||
                 device_info->vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers < 1000000)

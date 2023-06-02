@@ -2759,6 +2759,10 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
         D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
 {
+    const D3D12_RESOURCE_FLAGS high_priority_resource_flags =
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     struct d3d12_resource *object;
     HRESULT hr;
 
@@ -2792,6 +2796,10 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
     object->flags = flags;
     object->format = vkd3d_format_from_d3d12_resource_desc(device, desc, 0);
     object->res.cookie = vkd3d_allocate_cookie();
+    spinlock_init(&object->priority.spinlock);
+    object->priority.allows_dynamic_residency = false;
+    object->priority.d3d12priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
+    object->priority.residency_count = 1;
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
     object->view_map.resource_cookie = object->res.cookie;
 #endif
@@ -2817,6 +2825,24 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
 
         if ((desc->Flags & unsupported_flags) == unsupported_flags)
             FIXME_ONCE("ReadFromSubresource may be buggy on host-visible images with ALLOW_SIMULTANEOUS_ACCESS | ALLOW_UNORDERED_ACCESS.\n");
+    }
+
+    if ((flags & VKD3D_RESOURCE_COMMITTED) &&
+        device->device_info.memory_priority_features.memoryPriority &&
+        (desc->Flags & high_priority_resource_flags))
+    {
+        size_t resource_size = d3d12_resource_is_texture(object) ?
+            vkd3d_compute_resource_layouts_from_desc(device, &object->desc, NULL) :
+            object->desc.Width;
+        uint32_t adjust = vkd3d_get_priority_adjust(resource_size);
+
+        object->priority.d3d12priority = D3D12_RESIDENCY_PRIORITY_HIGH | adjust;
+
+        if (device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory)
+        {
+            if (object->heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
+                object->priority.residency_count = 0;
+        }
     }
 
     d3d12_device_add_ref(device);
@@ -2915,6 +2941,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
         else
             allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+
+        allocate_info.vk_memory_priority = object->priority.residency_count ? vkd3d_convert_to_vk_prio(object->priority.d3d12priority) : 0.f;
 
         if (heap_flags & D3D12_HEAP_FLAG_SHARED)
         {
@@ -3016,6 +3044,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         allocate_info.heap_desc.Alignment = desc->Alignment ? desc->Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         allocate_info.heap_desc.SizeInBytes = align(desc->Width, allocate_info.heap_desc.Alignment);
         allocate_info.heap_desc.Flags = heap_flags | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        allocate_info.vk_memory_priority = object->priority.residency_count ? vkd3d_convert_to_vk_prio(object->priority.d3d12priority) : 0.f;
 
         /* Be very careful with suballocated buffers. */
         if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ZERO_MEMORY_WORKAROUNDS_COMMITTED_BUFFER_UAV) &&
@@ -3032,6 +3061,11 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         object->res.vk_buffer = object->mem.resource.vk_buffer;
         object->res.va = object->mem.resource.va;
     }
+
+    object->priority.allows_dynamic_residency = 
+        device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
+        object->mem.chunk == NULL /* not suballocated */ &&
+        (device->memory_properties.memoryTypes[object->mem.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     *resource = object;
     return S_OK;
@@ -3133,6 +3167,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             allocate_info.memory_requirements = memory_requirements;
             allocate_info.heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
             allocate_info.heap_flags = 0;
+            allocate_info.vk_memory_priority = vkd3d_convert_to_vk_prio(D3D12_RESIDENCY_PRIORITY_NORMAL);
 
             if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
                 allocate_info.heap_flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
@@ -6034,6 +6069,7 @@ void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_dev
     rtv_desc->layer_count = key.u.texture.layer_count;
     rtv_desc->view = view;
     rtv_desc->resource = resource;
+    rtv_desc->plane_write_enable = 1u << 0;
 }
 
 void d3d12_rtv_desc_create_dsv(struct d3d12_rtv_desc *dsv_desc, struct d3d12_device *device,
@@ -6124,6 +6160,9 @@ void d3d12_rtv_desc_create_dsv(struct d3d12_rtv_desc *dsv_desc, struct d3d12_dev
     dsv_desc->layer_count = key.u.texture.layer_count;
     dsv_desc->view = view;
     dsv_desc->resource = resource;
+    dsv_desc->plane_write_enable =
+            (desc && (desc->Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) ? 0 : (1u << 0)) |
+            (desc && (desc->Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) ? 0 : (1u << 1));
 }
 
 /* ID3D12DescriptorHeap */
@@ -7893,14 +7932,47 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
     VkBufferUsageFlags vk_usage_flags;
     HRESULT hr;
 
-    bool requires_offset_buffer = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment > 4 &&
-            device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment <= 16;
+    bool requires_offset_buffer = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment > 4;
+    bool uses_ssbo = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment <= 16;
+    if (!uses_ssbo)
+        requires_offset_buffer = false;
 
-    /* Don't bother with descriptor buffers if we need to keep offset buffer around. */
+    /* Don't bother with descriptor buffers if we need to keep offset buffer around.
+     * Also, ignore descriptor buffers if implementation does not support non-uniform UBO indexing.
+     * We want to keep the descriptor buffer path as lean as possible. */
     if (!device->device_info.descriptor_buffer_features.descriptorBuffer ||
             !device->device_info.descriptor_buffer_features.descriptorBufferPushDescriptors ||
+            !device->device_info.vulkan_1_2_features.shaderUniformBufferArrayNonUniformIndexing ||
             requires_offset_buffer)
         return S_OK;
+
+    if (device->device_info.mutable_descriptor_features.mutableDescriptorType)
+    {
+        /* If we are forced to use MUTABLE_SINGLE_SET due to small address space for resources,
+         * we ignore descriptor buffers as well. Similar rationale to non-uniform UBO indexing.
+         * We will not add even more code paths to deal with that.
+         * Non-mutable + descriptor buffer is only relevant on AMD Windows driver for the time being,
+         * and eventually we will make mutable a hard requirement, so don't bother checking that case. */
+        VkDeviceSize required_resource_descriptors = 1000000 + 1; /* One magic SSBO for internal VA buffer. */
+        uint32_t flags = VKD3D_BINDLESS_MUTABLE_TYPE;
+        VkDeviceSize mutable_desc_size;
+
+        if (uses_ssbo)
+            flags |= VKD3D_BINDLESS_RAW_SSBO;
+
+        /* If we cannot interleave SSBO / texel buffers, we'll have to do them side by side.
+         * Implementation needs to support 2M descriptors in that case. */
+        if (!vkd3d_bindless_supports_embedded_mutable_type(device, flags))
+            required_resource_descriptors *= 2;
+
+        mutable_desc_size = vkd3d_bindless_get_mutable_descriptor_type_size(device);
+        if (device->device_info.descriptor_buffer_properties.maxResourceDescriptorBufferRange <
+                required_resource_descriptors * mutable_desc_size)
+        {
+            INFO("Small descriptor heap detected, falling back to MUTABLE_SINGLE_SET.\n");
+            return S_OK;
+        }
+    }
 
     vk_usage_flags = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
