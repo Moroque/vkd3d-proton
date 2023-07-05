@@ -1226,7 +1226,7 @@ void d3d12_desc_create_uav(vkd3d_cpu_descriptor_va_t descriptor, struct d3d12_de
         struct d3d12_resource *resource, struct d3d12_resource *counter_resource,
         const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc);
 void d3d12_desc_create_sampler(vkd3d_cpu_descriptor_va_t sampler,
-        struct d3d12_device *device, const D3D12_SAMPLER_DESC *desc);
+        struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc);
 
 void d3d12_desc_create_cbv_embedded(vkd3d_cpu_descriptor_va_t descriptor,
         struct d3d12_device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
@@ -1237,7 +1237,7 @@ void d3d12_desc_create_uav_embedded(vkd3d_cpu_descriptor_va_t descriptor, struct
         struct d3d12_resource *resource, struct d3d12_resource *counter_resource,
         const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc);
 void d3d12_desc_create_sampler_embedded(vkd3d_cpu_descriptor_va_t sampler,
-        struct d3d12_device *device, const D3D12_SAMPLER_DESC *desc);
+        struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc);
 
 bool vkd3d_create_vk_buffer_view(struct d3d12_device *device,
         VkBuffer vk_buffer, const struct vkd3d_format *format,
@@ -1245,7 +1245,7 @@ bool vkd3d_create_vk_buffer_view(struct d3d12_device *device,
 bool vkd3d_create_raw_buffer_view(struct d3d12_device *device,
         D3D12_GPU_VIRTUAL_ADDRESS gpu_address, VkBufferView *vk_buffer_view);
 HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
-        const D3D12_STATIC_SAMPLER_DESC *desc, VkSampler *vk_sampler);
+        const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler);
 
 #define D3D12_DESC_ALIGNMENT 64
 struct d3d12_rtv_desc
@@ -1697,7 +1697,7 @@ struct d3d12_root_signature
     uint32_t descriptor_table_count;
 
     unsigned int static_sampler_count;
-    D3D12_STATIC_SAMPLER_DESC *static_samplers_desc;
+    D3D12_STATIC_SAMPLER_DESC1 *static_samplers_desc;
     VkSampler *static_samplers;
 
     struct vkd3d_descriptor_hoist_info hoist_info;
@@ -1738,11 +1738,11 @@ HRESULT vkd3d_create_pipeline_layout(struct d3d12_device *device,
 int vkd3d_parse_root_signature_v_1_0(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_versioned_root_signature_desc *desc,
         vkd3d_shader_hash_t *compatibility_hash);
-int vkd3d_parse_root_signature_v_1_1(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_versioned_root_signature_desc *desc,
+int vkd3d_parse_root_signature_v_1_2(const struct vkd3d_shader_code *dxbc,
+        struct vkd3d_versioned_root_signature_desc *out_desc,
         vkd3d_shader_hash_t *compatibility_hash);
-int vkd3d_parse_root_signature_v_1_1_from_raw_payload(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_versioned_root_signature_desc *desc,
+int vkd3d_parse_root_signature_v_1_2_from_raw_payload(const struct vkd3d_shader_code *dxbc,
+        struct vkd3d_versioned_root_signature_desc *out_desc,
         vkd3d_shader_hash_t *compatibility_hash);
 
 VkShaderStageFlags vkd3d_vk_stage_flags_from_visibility(D3D12_SHADER_VISIBILITY visibility);
@@ -3091,7 +3091,7 @@ HRESULT vkd3d_sampler_state_init(struct vkd3d_sampler_state *state,
 void vkd3d_sampler_state_cleanup(struct vkd3d_sampler_state *state,
         struct d3d12_device *device);
 HRESULT vkd3d_sampler_state_create_static_sampler(struct vkd3d_sampler_state *state,
-        struct d3d12_device *device, const D3D12_STATIC_SAMPLER_DESC *desc, VkSampler *vk_sampler);
+        struct d3d12_device *device, const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler);
 HRESULT vkd3d_sampler_state_allocate_descriptor_set(struct vkd3d_sampler_state *state,
         struct d3d12_device *device, VkDescriptorSetLayout vk_layout, VkDescriptorSet *vk_set,
         VkDescriptorPool *vk_pool);
@@ -4017,6 +4017,8 @@ struct d3d12_caps
     D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9;
     D3D12_FEATURE_DATA_D3D12_OPTIONS10 options10;
     D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
 
     D3D_FEATURE_LEVEL max_feature_level;
     D3D_SHADER_MODEL max_shader_model;
@@ -4051,7 +4053,7 @@ struct vkd3d_cached_command_allocator
 };
 
 /* ID3D12Device */
-typedef ID3D12Device10 d3d12_device_iface;
+typedef ID3D12Device11 d3d12_device_iface;
 
 struct vkd3d_descriptor_qa_global_info;
 struct vkd3d_descriptor_qa_heap_buffer_data;
@@ -4220,17 +4222,17 @@ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_inf
 
 static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
 {
-    return ID3D12Device10_QueryInterface(&device->ID3D12Device_iface, iid, object);
+    return ID3D12Device11_QueryInterface(&device->ID3D12Device_iface, iid, object);
 }
 
 static inline ULONG d3d12_device_add_ref(struct d3d12_device *device)
 {
-    return ID3D12Device10_AddRef(&device->ID3D12Device_iface);
+    return ID3D12Device11_AddRef(&device->ID3D12Device_iface);
 }
 
 static inline ULONG d3d12_device_release(struct d3d12_device *device)
 {
-    return ID3D12Device10_Release(&device->ID3D12Device_iface);
+    return ID3D12Device11_Release(&device->ID3D12Device_iface);
 }
 
 static inline bool d3d12_device_use_embedded_mutable_descriptors(struct d3d12_device *device)
@@ -4255,8 +4257,9 @@ static inline struct d3d12_desc_split_metadata d3d12_desc_decode_metadata(
          * If the descriptor is smaller, we can use the planar method where we encode log2 offset. */
         if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
         {
-            struct vkd3d_descriptor_metadata *m =
-                    (void *)(uintptr_t)(va + device->bindless_state.descriptor_buffer_packed_metadata_offset);
+            struct vkd3d_descriptor_metadata *m;
+            va &= ~VKD3D_RESOURCE_EMBEDDED_CACHED_MASK;
+            m = (void *)(uintptr_t)(va + device->bindless_state.descriptor_buffer_packed_metadata_offset);
             meta.view = &m->view;
             meta.types = &m->types;
         }
@@ -4725,7 +4728,7 @@ struct vkd3d_view_key
     {
         struct vkd3d_buffer_view_desc buffer;
         struct vkd3d_texture_view_desc texture;
-        D3D12_SAMPLER_DESC sampler;
+        D3D12_SAMPLER_DESC2 sampler;
     } u;
 };
 struct vkd3d_view *vkd3d_view_map_create_view(struct vkd3d_view_map *view_map,

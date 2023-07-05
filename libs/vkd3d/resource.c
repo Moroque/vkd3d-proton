@@ -876,13 +876,14 @@ static uint32_t vkd3d_view_entry_hash(const void *key)
             hash = hash_combine(hash, (uint32_t)k->u.sampler.ComparisonFunc);
             if (d3d12_sampler_needs_border_color(k->u.sampler.AddressU, k->u.sampler.AddressV, k->u.sampler.AddressW))
             {
-                hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.BorderColor[0]));
-                hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.BorderColor[1]));
-                hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.BorderColor[2]));
-                hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.BorderColor[3]));
+                hash = hash_combine(hash, k->u.sampler.UintBorderColor[0]);
+                hash = hash_combine(hash, k->u.sampler.UintBorderColor[1]);
+                hash = hash_combine(hash, k->u.sampler.UintBorderColor[2]);
+                hash = hash_combine(hash, k->u.sampler.UintBorderColor[3]);
             }
             hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.MinLOD));
             hash = hash_combine(hash, float_bits_to_uint32(k->u.sampler.MaxLOD));
+            hash = hash_combine(hash, k->u.sampler.Flags);
             break;
 
         default:
@@ -937,12 +938,11 @@ static bool vkd3d_view_entry_compare(const void *key, const struct hash_map_entr
                     k->u.sampler.MaxAnisotropy == e->key.u.sampler.MaxAnisotropy &&
                     k->u.sampler.ComparisonFunc == e->key.u.sampler.ComparisonFunc &&
                     (!d3d12_sampler_needs_border_color(k->u.sampler.AddressU, k->u.sampler.AddressV, k->u.sampler.AddressW) ||
-                        (k->u.sampler.BorderColor[0] == e->key.u.sampler.BorderColor[0] &&
-                        k->u.sampler.BorderColor[1] == e->key.u.sampler.BorderColor[1] &&
-                        k->u.sampler.BorderColor[2] == e->key.u.sampler.BorderColor[2] &&
-                        k->u.sampler.BorderColor[3] == e->key.u.sampler.BorderColor[3])) &&
+                            memcmp(k->u.sampler.UintBorderColor, e->key.u.sampler.UintBorderColor,
+                                    sizeof(e->key.u.sampler.UintBorderColor)) == 0) &&
                     k->u.sampler.MinLOD == e->key.u.sampler.MinLOD &&
-                    k->u.sampler.MaxLOD == e->key.u.sampler.MaxLOD;
+                    k->u.sampler.MaxLOD == e->key.u.sampler.MaxLOD &&
+                    k->u.sampler.Flags == e->key.u.sampler.Flags;
             break;
 
         default:
@@ -978,7 +978,7 @@ void vkd3d_view_map_destroy(struct vkd3d_view_map *view_map, struct d3d12_device
 static struct vkd3d_view *vkd3d_view_create(enum vkd3d_view_type type);
 
 static HRESULT d3d12_create_sampler(struct d3d12_device *device,
-        const D3D12_SAMPLER_DESC *desc, VkSampler *vk_sampler);
+        const D3D12_SAMPLER_DESC2 *desc, VkSampler *vk_sampler);
 
 static void vkd3d_view_tag_debug_name(struct vkd3d_view *view, struct d3d12_device *device)
 {
@@ -1105,13 +1105,13 @@ struct vkd3d_view *vkd3d_view_map_create_view(struct vkd3d_view_map *view_map,
 
 struct vkd3d_sampler_key
 {
-    D3D12_STATIC_SAMPLER_DESC desc;
+    D3D12_STATIC_SAMPLER_DESC1 desc;
 };
 
 struct vkd3d_sampler_entry
 {
     struct hash_map_entry entry;
-    D3D12_STATIC_SAMPLER_DESC desc;
+    D3D12_STATIC_SAMPLER_DESC1 desc;
     VkSampler vk_sampler;
 };
 
@@ -1130,6 +1130,7 @@ static uint32_t vkd3d_sampler_entry_hash(const void *key)
     hash = hash_combine(hash, (uint32_t)k->desc.BorderColor);
     hash = hash_combine(hash, float_bits_to_uint32(k->desc.MinLOD));
     hash = hash_combine(hash, float_bits_to_uint32(k->desc.MaxLOD));
+    hash = hash_combine(hash, k->desc.Flags);
     return hash;
 }
 
@@ -1147,7 +1148,8 @@ static bool vkd3d_sampler_entry_compare(const void *key, const struct hash_map_e
             k->desc.ComparisonFunc == e->desc.ComparisonFunc &&
             k->desc.BorderColor == e->desc.BorderColor &&
             k->desc.MinLOD == e->desc.MinLOD &&
-            k->desc.MaxLOD == e->desc.MaxLOD;
+            k->desc.MaxLOD == e->desc.MaxLOD &&
+            k->desc.Flags == e->desc.Flags;
 }
 
 HRESULT vkd3d_sampler_state_init(struct vkd3d_sampler_state *state,
@@ -1189,10 +1191,10 @@ void vkd3d_sampler_state_cleanup(struct vkd3d_sampler_state *state,
 }
 
 HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
-        const D3D12_STATIC_SAMPLER_DESC *desc, VkSampler *vk_sampler);
+        const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler);
 
 HRESULT vkd3d_sampler_state_create_static_sampler(struct vkd3d_sampler_state *state,
-        struct d3d12_device *device, const D3D12_STATIC_SAMPLER_DESC *desc, VkSampler *vk_sampler)
+        struct d3d12_device *device, const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler)
 {
     struct vkd3d_sampler_entry entry, *e;
     HRESULT hr;
@@ -1516,6 +1518,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_QueryInterface(d3d12_resource_if
         REFIID riid, void **object)
 {
     TRACE("iface %p, riid %s, object %p.\n", iface, debugstr_guid(riid), object);
+
+    if (!object)
+        return E_POINTER;
 
     if (IsEqualGUID(riid, &IID_ID3D12Resource)
             || IsEqualGUID(riid, &IID_ID3D12Resource1)
@@ -2174,6 +2179,12 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3
 {
     const struct vkd3d_format *format;
 
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->SampleDesc.Count > 1)
+    {
+        WARN("MSAA not supported on 1D and 3D textures.\n");
+        return E_INVALIDARG;
+    }
+
     switch (desc->Dimension)
     {
         case D3D12_RESOURCE_DIMENSION_BUFFER:
@@ -2213,6 +2224,22 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3
             }
             /* Fall through. */
         case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+            if (desc->SampleDesc.Count > 1)
+            {
+                if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)))
+                {
+                    WARN("Multi-sampled textures must be created with render target or depth attachment usage.\n");
+                    return E_INVALIDARG;
+                }
+
+                if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                        !device->d3d12_caps.options14.WriteableMSAATexturesSupported)
+                {
+                    WARN("MSAA UAV textures not supported.\n");
+                    return E_INVALIDARG;
+                }
+            }
+            /* Fall through */
         case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
             if (desc->SampleDesc.Count == 0)
             {
@@ -4837,12 +4864,25 @@ static struct vkd3d_view *vkd3d_create_texture_uav_view(struct d3d12_device *dev
                 key.u.texture.layer_count = 1;
                 key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2D.PlaneSlice);
                 break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DMS:
+                key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D;
+                key.u.texture.miplevel_idx = 0;
+                key.u.texture.layer_count = 1;
+                key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2D.PlaneSlice);
+                break;
             case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
                 key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
                 key.u.texture.miplevel_idx = desc->Texture2DArray.MipSlice;
                 key.u.texture.layer_idx = desc->Texture2DArray.FirstArraySlice;
                 key.u.texture.layer_count = desc->Texture2DArray.ArraySize;
                 key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2DArray.PlaneSlice);
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY:
+                key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                key.u.texture.miplevel_idx = 0;
+                key.u.texture.layer_idx = desc->Texture2DMSArray.FirstArraySlice;
+                key.u.texture.layer_count = desc->Texture2DMSArray.ArraySize;
+                key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, 0);
                 break;
             case D3D12_UAV_DIMENSION_TEXTURE3D:
                 key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_3D;
@@ -4969,9 +5009,15 @@ static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *dev
             desc->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DMS &&
             desc->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY)
     {
+        bool found;
+
         key.u.texture.miplevel_clamp = floor(key.u.texture.miplevel_clamp);
 
-        if (!hash_map_find(&resource->view_map.map, &key))
+        rw_spinlock_acquire_read(&resource->view_map.spinlock);
+        found = !!hash_map_find(&resource->view_map.map, &key);
+        rw_spinlock_release_read(&resource->view_map.spinlock);
+
+        if (!found)
         {
             uint32_t starting_mip = key.u.texture.miplevel_idx;
             uint32_t mip_count = key.u.texture.miplevel_count != UINT32_MAX ?
@@ -5728,45 +5774,60 @@ static VkBorderColor vk_static_border_color_from_d3d12(D3D12_STATIC_BORDER_COLOR
             return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
         case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE:
             return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT:
+            return VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT:
+            return VK_BORDER_COLOR_INT_OPAQUE_WHITE;
         default:
             WARN("Unhandled static border color %u.\n", border_color);
             return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
 }
 
-static VkBorderColor vk_border_color_from_d3d12(struct d3d12_device *device, const float *border_color)
+static VkBorderColor vk_border_color_from_d3d12(struct d3d12_device *device, const uint32_t *border_color,
+        D3D12_SAMPLER_FLAGS flags)
 {
+    bool uint_border = !!(flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR);
     unsigned int i;
 
+#define ONE_FP32 0x3f800000
     static const struct
     {
-        float color[4];
+        uint32_t color[4];
+        bool uint_border;
         VkBorderColor vk_border_color;
     }
     border_colors[] = {
-      { {0.0f, 0.0f, 0.0f, 0.0f}, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK },
-      { {0.0f, 0.0f, 0.0f, 1.0f}, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK },
-      { {1.0f, 1.0f, 1.0f, 1.0f}, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE },
+      { {0, 0, 0, 0}, false, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK },
+      { {0, 0, 0, ONE_FP32}, false, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK },
+      { {ONE_FP32, ONE_FP32, ONE_FP32, ONE_FP32}, false, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE },
+      { {0, 0, 0, 0}, true, VK_BORDER_COLOR_INT_TRANSPARENT_BLACK },
+      { {0, 0, 0, 1}, true, VK_BORDER_COLOR_INT_OPAQUE_BLACK },
+      { {1, 1, 1, 1}, true, VK_BORDER_COLOR_INT_OPAQUE_WHITE},
     };
+#undef ONE_FP32
 
     for (i = 0; i < ARRAY_SIZE(border_colors); i++)
     {
-        if (!memcmp(border_color, border_colors[i].color, sizeof(border_colors[i].color)))
+        if (uint_border == border_colors[i].uint_border &&
+                !memcmp(border_color, border_colors[i].color, sizeof(border_colors[i].color)))
+        {
             return border_colors[i].vk_border_color;
+        }
     }
 
     if (!device->device_info.custom_border_color_features.customBorderColorWithoutFormat)
     {
-        FIXME("Unsupported border color (%f, %f, %f, %f).\n",
+        FIXME("Unsupported border color (#%x, #%x, #%x, #%x).\n",
                 border_color[0], border_color[1], border_color[2], border_color[3]);
-        return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        return uint_border ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
 
-    return VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+    return uint_border ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
 }
 
 HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
-        const D3D12_STATIC_SAMPLER_DESC *desc, VkSampler *vk_sampler)
+        const D3D12_STATIC_SAMPLER_DESC1 *desc, VkSampler *vk_sampler)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkSamplerReductionModeCreateInfoEXT reduction_desc;
@@ -5810,7 +5871,7 @@ HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
 }
 
 static HRESULT d3d12_create_sampler(struct d3d12_device *device,
-        const D3D12_SAMPLER_DESC *desc, VkSampler *vk_sampler)
+        const D3D12_SAMPLER_DESC2 *desc, VkSampler *vk_sampler)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkSamplerCustomBorderColorCreateInfoEXT border_color_info;
@@ -5820,8 +5881,8 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
 
     border_color_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
     border_color_info.pNext = NULL;
-    memcpy(border_color_info.customBorderColor.float32, desc->BorderColor,
-            sizeof(border_color_info.customBorderColor.float32));
+    memcpy(border_color_info.customBorderColor.uint32, desc->UintBorderColor,
+            sizeof(border_color_info.customBorderColor.uint32));
     border_color_info.format = VK_FORMAT_UNDEFINED;
 
     reduction_desc.sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT;
@@ -5854,10 +5915,13 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
         sampler_desc.maxAnisotropy = min(16.0f, sampler_desc.maxAnisotropy);
 
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
-        sampler_desc.borderColor = vk_border_color_from_d3d12(device, desc->BorderColor);
+        sampler_desc.borderColor = vk_border_color_from_d3d12(device, desc->UintBorderColor, desc->Flags);
 
-    if (sampler_desc.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT)
+    if (sampler_desc.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
+            sampler_desc.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT)
+    {
         vk_prepend_struct(&sampler_desc, &border_color_info);
+    }
 
     if (reduction_desc.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE &&
             device->device_info.vulkan_1_2_features.samplerFilterMinmax)
@@ -5870,7 +5934,7 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
 }
 
 void d3d12_desc_create_sampler_embedded(vkd3d_cpu_descriptor_va_t desc_va,
-        struct d3d12_device *device, const D3D12_SAMPLER_DESC *desc)
+        struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDescriptorGetInfoEXT get_info;
@@ -5899,7 +5963,7 @@ void d3d12_desc_create_sampler_embedded(vkd3d_cpu_descriptor_va_t desc_va,
 }
 
 void d3d12_desc_create_sampler(vkd3d_cpu_descriptor_va_t desc_va,
-        struct d3d12_device *device, const D3D12_SAMPLER_DESC *desc)
+        struct d3d12_device *device, const D3D12_SAMPLER_DESC2 *desc)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     union vkd3d_descriptor_info descriptor_info;
@@ -6170,6 +6234,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_descriptor_heap_QueryInterface(ID3D12Desc
         REFIID riid, void **object)
 {
     TRACE("iface %p, riid %s, object %p.\n", iface, debugstr_guid(riid), object);
+
+    if (!object)
+        return E_POINTER;
 
     if (IsEqualGUID(riid, &IID_ID3D12DescriptorHeap)
             || IsEqualGUID(riid, &IID_ID3D12Pageable)
@@ -7355,6 +7422,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_query_heap_QueryInterface(ID3D12QueryHeap
         REFIID iid, void **out)
 {
     TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (!out)
+        return E_POINTER;
 
     if (IsEqualGUID(iid, &IID_ID3D12QueryHeap)
             || IsEqualGUID(iid, &IID_ID3D12Pageable)

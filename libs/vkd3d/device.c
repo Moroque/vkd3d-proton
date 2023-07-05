@@ -523,6 +523,7 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION, 0 },
     /* Age of Wonders 4 (1669000). Extremely stuttery performance with ReBAR. */
     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
+    { VKD3D_STRING_COMPARE_HASH_EQUAL, "e89c09e4505d8d43", VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -607,7 +608,7 @@ static void vkd3d_instance_apply_application_workarounds(void)
     if (!vkd3d_get_program_name(app))
         return;
 
-    INFO("Program name: \"%s\"\n", app);
+    INFO("Program name: \"%s\" (hash: %016"PRIx64")\n", app, hash_fnv1_iterate_string(hash_fnv1_init(), app));
 
     for (i = 0; i < ARRAY_SIZE(application_override); i++)
     {
@@ -672,8 +673,11 @@ static void vkd3d_instance_deduce_config_flags_from_environment(void)
         vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS;
     }
 
+    /* RADV_THREAD_TRACE_xxx are deprecated and will be removed at some point. */
     if (vkd3d_get_env_var("RADV_THREAD_TRACE", env, sizeof(env)) ||
-            vkd3d_get_env_var("RADV_THREAD_TRACE_TRIGGER", env, sizeof(env)))
+            vkd3d_get_env_var("RADV_THREAD_TRACE_TRIGGER", env, sizeof(env)) ||
+            (vkd3d_get_env_var("MESA_VK_TRACE", env, sizeof(env)) &&
+                strcmp(env, "rgp") == 0))
     {
         INFO("RADV thread trace is enabled. Forcing debug utils to be enabled for labels.\n");
         /* Disable caching so we can get full debug information when emitting labels. */
@@ -781,6 +785,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"force_compute_root_parameters_push_ubo", VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO},
     {"skip_driver_workarounds", VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS},
     {"curb_memory_pso_cache", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE},
+    {"enable_experimental_features", VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -1269,7 +1274,8 @@ static void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_d
      * but there is no known workaround for this. */
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS))
     {
-        if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
+        if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                VKD3D_DRIVER_VERSION_MAJOR_NV(info->properties2.properties.driverVersion) < 535)
         {
             WARN("Disabling VK_KHR_present_wait on NV drivers due to spurious failure to create swapchains.\n");
             device->vk_info.KHR_present_wait = false;
@@ -2988,6 +2994,9 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
 {
     TRACE("iface %p, riid %s, object %p.\n", iface, debugstr_guid(riid), object);
 
+    if (!object)
+        return E_POINTER;
+
     if (IsEqualGUID(riid, &IID_ID3D12Device)
             || IsEqualGUID(riid, &IID_ID3D12Device1)
             || IsEqualGUID(riid, &IID_ID3D12Device2)
@@ -2999,10 +3008,11 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
             || IsEqualGUID(riid, &IID_ID3D12Device8)
             || IsEqualGUID(riid, &IID_ID3D12Device9)
             || IsEqualGUID(riid, &IID_ID3D12Device10)
+            || IsEqualGUID(riid, &IID_ID3D12Device11)
             || IsEqualGUID(riid, &IID_ID3D12Object)
             || IsEqualGUID(riid, &IID_IUnknown))
     {
-        ID3D12Device10_AddRef(iface);
+        ID3D12Device11_AddRef(iface);
         *object = iface;
         return S_OK;
     }
@@ -3739,14 +3749,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            if (!data->HighestVersion || data->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_1)
+            if (!data->HighestVersion || data->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_2)
             {
                 WARN("Unrecognized root signature version %#x.\n", data->HighestVersion);
                 return E_INVALIDARG;
             }
 
             TRACE("Root signature requested %#x.\n", data->HighestVersion);
-            data->HighestVersion = min(data->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_1);
+            data->HighestVersion = min(data->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_2);
 
             TRACE("Root signature version %#x.\n", data->HighestVersion);
             return S_OK;
@@ -4085,12 +4095,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            data->UnrestrictedBufferTextureCopyPitchSupported = FALSE;
-            data->UnrestrictedVertexElementAlignmentSupported = FALSE;
-            data->InvertedViewportHeightFlipsYSupported = FALSE;
-            data->InvertedViewportDepthFlipsZSupported = FALSE;
-            data->TextureCopyBetweenDimensionsSupported = FALSE;
-            data->AlphaBlendFactorSupported = FALSE;
+            *data = device->d3d12_caps.options13;
+
+            TRACE("Inverted viewport height flips Y supported %u.", data->InvertedViewportHeightFlipsYSupported);
+            TRACE("Inverted viewport deps flips Z supported %u.", data->InvertedViewportDepthFlipsZSupported);
             return S_OK;
         }
 
@@ -4104,9 +4112,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            data->AdvancedTextureOpsSupported = FALSE;
-            data->WriteableMSAATexturesSupported = FALSE;
-            data->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            *data = device->d3d12_caps.options14;
+
+            TRACE("AdvancedTextureOpsSupported %u\n", data->AdvancedTextureOpsSupported);
+            TRACE("WriteableMSAATexturesSupported %u\n", data->WriteableMSAATexturesSupported);
+            TRACE("IndependentFrontAndBackStencilRefMaskSupported %u\n", data->IndependentFrontAndBackStencilRefMaskSupported);
+
             return S_OK;
         }
 
@@ -4335,14 +4346,40 @@ static void STDMETHODCALLTYPE d3d12_device_CreateSampler_embedded(d3d12_device_i
         const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    D3D12_SAMPLER_DESC2 desc2;
+
+    TRACE("iface %p, desc %p, descriptor %#lx.\n", iface, desc, descriptor.ptr);
+
+    memcpy(&desc2, desc, sizeof(*desc));
+    desc2.Flags = D3D12_SAMPLER_FLAG_NONE;
+    d3d12_desc_create_sampler_embedded(descriptor.ptr, device, &desc2);
+}
+
+static void STDMETHODCALLTYPE d3d12_device_CreateSampler_default(d3d12_device_iface *iface,
+        const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    D3D12_SAMPLER_DESC2 desc2;
+
+    TRACE("iface %p, desc %p, descriptor %#lx.\n", iface, desc, descriptor.ptr);
+
+    memcpy(&desc2, desc, sizeof(*desc));
+    desc2.Flags = D3D12_SAMPLER_FLAG_NONE;
+    d3d12_desc_create_sampler(descriptor.ptr, device, &desc2);
+}
+
+static void STDMETHODCALLTYPE d3d12_device_CreateSampler2_embedded(d3d12_device_iface *iface,
+        const D3D12_SAMPLER_DESC2 *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
 
     TRACE("iface %p, desc %p, descriptor %#lx.\n", iface, desc, descriptor.ptr);
 
     d3d12_desc_create_sampler_embedded(descriptor.ptr, device, desc);
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CreateSampler_default(d3d12_device_iface *iface,
-        const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+static void STDMETHODCALLTYPE d3d12_device_CreateSampler2_default(d3d12_device_iface *iface,
+        const D3D12_SAMPLER_DESC2 *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
 
@@ -6390,7 +6427,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource2(d3d12_devi
 
 /* Gotta love C sometimes ... :') */
 #define VKD3D_DECLARE_D3D12_DEVICE_VARIANT(name, create_desc, copy_desc_variant) \
-CONST_VTBL struct ID3D12Device10Vtbl d3d12_device_vtbl_##name = \
+CONST_VTBL struct ID3D12Device11Vtbl d3d12_device_vtbl_##name = \
 { \
     /* IUnknown methods */ \
     d3d12_device_QueryInterface, \
@@ -6484,6 +6521,8 @@ CONST_VTBL struct ID3D12Device10Vtbl d3d12_device_vtbl_##name = \
     d3d12_device_CreateCommittedResource3, \
     d3d12_device_CreatePlacedResource2, \
     d3d12_device_CreateReservedResource2, \
+    /* ID3D12Device11 methods */ \
+    d3d12_device_CreateSampler2_##create_desc, \
 }
 
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(default, default, default);
@@ -6918,6 +6957,30 @@ static void d3d12_device_caps_init_feature_options11(struct d3d12_device *device
             device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment <= 16;
 }
 
+static void d3d12_device_caps_init_feature_options13(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 *options13 = &device->d3d12_caps.options13;
+
+    options13->InvertedViewportHeightFlipsYSupported = TRUE;
+    options13->InvertedViewportDepthFlipsZSupported = TRUE;
+}
+
+static void d3d12_device_caps_init_feature_options14(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 *options14 = &device->d3d12_caps.options14;
+
+    /* This is more dubious to enable.
+     * The only blocking feature here is texture with dynamic offsets.
+     * In Vulkan as-is, only textureGather supports integer offsets.
+     * This works fine in practice, however, but we shouldn't expose this by default
+     * until we have an actual extension. */
+    options14->AdvancedTextureOpsSupported = (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES) &&
+            device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7;
+    options14->WriteableMSAATexturesSupported = device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7 &&
+            device->device_info.features2.features.shaderStorageImageMultisample;
+    options14->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+}
+
 static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
 {
     const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
@@ -7123,6 +7186,39 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
             INFO("Enabling support for SM 6.6.\n");
             device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_6;
         }
+
+        /* SM 6.7 adds:
+         * - QuadAny / All (required)
+         *   - This can be implemented directly with quad shuffles.
+         *   - In both D3D12 docs and on real implementations, undefined behavior happens when inactive lanes are used.
+         * - Helper lanes in wave ops (required)
+         *   - Vulkan by default says that helper lanes participate, but they may not participate in any non-quad operation.
+         *   - In practice, this assumption holds, and we can enable it based on driverID checks where we know this behavior
+         *     is normal.
+         * - Programmable offsets (AdvancedTextureOps)
+         *   - There is no legal way to use this, except for textureGather.
+         *   - In practice however, it just happens to work anyways.
+         *   - It's optional and depends on castable texture formats either way.
+         *   - We can enable it through app-opt if there is a real need for it.
+         * - MSAA UAV (separate feature)
+         *   - Trivial Vulkan catch-up
+         * - SampleCmpLevel (AdvancedTextureOps)
+         *   - Trivial Vulkan catch-up
+         * - Raw Gather (AdvancedTextureOps)
+         *   - Looks scary, but the view format must be R16, R32 or R32G32_UINT, which makes it trivial.
+         *   - It behaves exactly like you're doing GatherRed or bitcast(GatherRed, GatherGreen).
+         *   - Tested against RGBA8, and it does *not* reinterpret RGBA8 to R32 in the shader.
+         * - Integer sampling (AdvancedTextureOps)
+         *   - Trivial Vulkan catch-up. Requires implementing border colors as well.
+         */
+        if (device->d3d12_caps.max_shader_model == D3D_SHADER_MODEL_6_6 &&
+                (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES))
+        {
+            /* Helper lanes in wave ops behavior appears to work as intended on NV and RADV.
+             * Technically needs an extension to *guarantee* this behavior however ... */
+            INFO("Experimentally enabling support for SM 6.7.\n");
+            device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_7;
+        }
     }
     else
     {
@@ -7227,6 +7323,8 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
 static void d3d12_device_caps_init(struct d3d12_device *device)
 {
     d3d12_device_caps_init_shader_model(device);
+    d3d12_device_caps_shader_model_override(device);
+
     d3d12_device_caps_init_feature_options(device);
     d3d12_device_caps_init_feature_options1(device);
     d3d12_device_caps_init_feature_options2(device);
@@ -7239,9 +7337,10 @@ static void d3d12_device_caps_init(struct d3d12_device *device)
     d3d12_device_caps_init_feature_options9(device);
     d3d12_device_caps_init_feature_options10(device);
     d3d12_device_caps_init_feature_options11(device);
+    d3d12_device_caps_init_feature_options13(device);
+    d3d12_device_caps_init_feature_options14(device);
     d3d12_device_caps_init_feature_level(device);
 
-    d3d12_device_caps_shader_model_override(device);
     d3d12_device_caps_override(device);
     d3d12_device_caps_override_application(device);
 }
