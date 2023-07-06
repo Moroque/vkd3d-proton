@@ -927,6 +927,13 @@ struct vkd3d_subresource_layout
     size_t depth_pitch;
 };
 
+struct vkd3d_format_compatibility_list
+{
+    unsigned int format_count;
+    VkFormat vk_formats[VKD3D_MAX_COMPATIBLE_FORMAT_COUNT];
+    DXGI_FORMAT uint_format;
+};
+
 /* ID3D12Resource */
 typedef ID3D12Resource2 d3d12_resource_iface;
 
@@ -958,6 +965,7 @@ struct d3d12_resource
     struct d3d12_sparse_info sparse;
     struct vkd3d_view_map view_map;
     struct vkd3d_subresource_layout *subresource_layouts;
+    struct vkd3d_format_compatibility_list format_compatibility_list;
 
     priority_info priority;
 
@@ -3516,13 +3524,6 @@ static inline uint8_t *vkd3d_bindless_state_get_null_descriptor_payload(struct v
     return bindless_state->null_descriptor_payloads[index - 2];
 }
 
-struct vkd3d_format_compatibility_list
-{
-    unsigned int format_count;
-    VkFormat vk_formats[VKD3D_MAX_COMPATIBLE_FORMAT_COUNT];
-    DXGI_FORMAT uint_format;
-};
-
 void vkd3d_format_compatibility_list_add_format(struct vkd3d_format_compatibility_list *list, VkFormat vk_format);
 
 struct vkd3d_memory_info_domain
@@ -4053,7 +4054,7 @@ struct vkd3d_cached_command_allocator
 };
 
 /* ID3D12Device */
-typedef ID3D12Device11 d3d12_device_iface;
+typedef ID3D12Device12 d3d12_device_iface;
 
 struct vkd3d_descriptor_qa_global_info;
 struct vkd3d_descriptor_qa_heap_buffer_data;
@@ -4222,17 +4223,17 @@ static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_inf
 
 static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
 {
-    return ID3D12Device11_QueryInterface(&device->ID3D12Device_iface, iid, object);
+    return ID3D12Device12_QueryInterface(&device->ID3D12Device_iface, iid, object);
 }
 
 static inline ULONG d3d12_device_add_ref(struct d3d12_device *device)
 {
-    return ID3D12Device11_AddRef(&device->ID3D12Device_iface);
+    return ID3D12Device12_AddRef(&device->ID3D12Device_iface);
 }
 
 static inline ULONG d3d12_device_release(struct d3d12_device *device)
 {
-    return ID3D12Device11_Release(&device->ID3D12Device_iface);
+    return ID3D12Device12_Release(&device->ID3D12Device_iface);
 }
 
 static inline bool d3d12_device_use_embedded_mutable_descriptors(struct d3d12_device *device)
@@ -4518,6 +4519,12 @@ struct vkd3d_format
     enum vkd3d_format_type type;
     bool is_emulated;
     const struct vkd3d_format_footprint *plane_footprints;
+    /* Only includes format features explicitly for vk_format. */
+    VkFormatFeatureFlags vk_format_features;
+    /* If the format is TYPELESS or relaxed castable (e.g. sRGB to UNORM),
+     * the feature list includes all potential format features.
+     * This will hold either just depth features or color features depending on which format query is used. */
+    VkFormatFeatureFlags vk_format_features_castable;
 };
 
 static inline size_t vkd3d_format_get_data_offset(const struct vkd3d_format *format,

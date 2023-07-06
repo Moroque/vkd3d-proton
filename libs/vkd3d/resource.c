@@ -754,6 +754,8 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
     if ((vr = VK_CALL(vkCreateImage(device->vk_device, &create_info.image_info, NULL, vk_image))) < 0)
         WARN("Failed to create Vulkan image, vr %d.\n", vr);
 
+    resource->format_compatibility_list = create_info.format_compat_list;
+
     return hresult_from_vk_result(vr);
 }
 
@@ -2102,6 +2104,12 @@ static HRESULT d3d12_validate_resource_flags(D3D12_RESOURCE_FLAGS flags)
     if ((flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     {
         ERR("ALLOW_UNORDERED_ACCESS and ALLOW_DEPTH_STENCIL is not allowed.\n");
+        return E_INVALIDARG;
+    }
+
+    if ((flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    {
+        ERR("ALLOW_RENDER_TARGET and ALLOW_DEPTH_STENCIL is not allowed.\n");
         return E_INVALIDARG;
     }
 
