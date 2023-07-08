@@ -396,8 +396,10 @@ void vkd3d_format_compatibility_list_add_format(struct vkd3d_format_compatibilit
 
     if (!found)
     {
-        assert(list->format_count < ARRAY_SIZE(list->vk_formats));
-        list->vk_formats[list->format_count++] = vk_format;
+        if (list->format_count < ARRAY_SIZE(list->vk_formats))
+            list->vk_formats[list->format_count++] = vk_format;
+        else
+            WARN("Format compatiblity list overflowed.\n");
     }
 }
 
@@ -429,7 +431,6 @@ static HRESULT vkd3d_init_format_compatibility_lists(struct d3d12_device *device
         for (j = 0; j < ARRAY_SIZE(src->view_formats) && src->view_formats[j]; j++)
             vkd3d_format_compatibility_list_add_format(dst, vkd3d_get_vk_format(src->view_formats[j]));
     }
-
 
     device->format_compatibility_list_count = count;
     device->format_compatibility_lists = lists;

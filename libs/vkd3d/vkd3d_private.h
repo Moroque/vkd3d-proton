@@ -1006,7 +1006,9 @@ LONG64 vkd3d_allocate_cookie();
 
 bool d3d12_resource_is_cpu_accessible(const struct d3d12_resource *resource);
 void d3d12_resource_promote_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC1 *desc1);
-HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3d12_device *device);
+HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_device *device);
 VkImageSubresource d3d12_resource_get_vk_subresource(const struct d3d12_resource *resource,
         uint32_t subresource_idx, bool all_aspects);
 VkImageAspectFlags vk_image_aspect_flags_from_d3d12(
@@ -1021,13 +1023,19 @@ UINT d3d12_plane_index_from_vk_aspect(VkImageAspectFlagBits aspect);
 
 HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, HANDLE shared_handle, struct d3d12_resource **resource);
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        HANDLE shared_handle, struct d3d12_resource **resource);
 HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource);
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource);
 HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource);
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource);
 
 static inline struct d3d12_resource *impl_from_ID3D12Resource2(ID3D12Resource2 *iface)
 {
@@ -1057,7 +1065,9 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
 HRESULT vkd3d_create_buffer_explicit_usage(struct d3d12_device *device,
         VkBufferUsageFlags vk_usage, VkDeviceSize vk_size, VkBuffer *vk_buffer);
 HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
-        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_ALLOCATION_INFO *allocation_info);
+        const D3D12_RESOURCE_DESC1 *desc,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        D3D12_RESOURCE_ALLOCATION_INFO *allocation_info);
 
 enum vkd3d_view_type
 {
@@ -4018,6 +4028,7 @@ struct d3d12_caps
     D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9;
     D3D12_FEATURE_DATA_D3D12_OPTIONS10 options10;
     D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
     D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
 

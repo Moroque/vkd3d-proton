@@ -244,18 +244,78 @@ static unsigned int max_miplevel_count(const D3D12_RESOURCE_DESC1 *desc)
     return vkd3d_log2i(size) + 1;
 }
 
+static bool vkd3d_get_castable_format_compatibility_list(const struct d3d12_device *device,
+        const D3D12_RESOURCE_DESC1 *desc, UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct vkd3d_format_compatibility_list *list, VkImageCreateFlags *vk_flags)
+{
+    const struct vkd3d_format *format = vkd3d_get_format(device, desc->Format, false);
+    bool base_format_is_compressed;
+    unsigned int i;
+
+    base_format_is_compressed = vkd3d_format_is_compressed(format);
+
+    memset(list, 0, sizeof(*list));
+
+    /* Odd-ball case which is non-sense, but allowed. Base format is TYPELESS and castable list has only FLOAT.
+     * We'll end up creating { UINT, FLOAT } in this case which could screw over compression,
+     * but this is bizarre enough that we should not try to work around it unless this becomes an actual problem. */
+    vkd3d_format_compatibility_list_add_format(list, format->vk_format);
+    if (format->type == VKD3D_FORMAT_TYPE_TYPELESS)
+        WARN("Using typeless base type #%x in a resource with castable formats.\n", desc->Format);
+
+    for (i = 0; i < num_castable_formats; i++)
+    {
+        format = vkd3d_get_format(device, castable_formats[i], false);
+        /* We have validated this already. */
+        assert(format);
+
+        /* For purposes for format list, typeless formats are ignored since you cannot create views of them,
+         * but they *do* contribute to format feature checks for some reason ... >_< */
+        if (format->type == VKD3D_FORMAT_TYPE_TYPELESS)
+            continue;
+
+        vkd3d_format_compatibility_list_add_format(list, format->vk_format);
+        if (base_format_is_compressed && !vkd3d_format_is_compressed(format))
+            *vk_flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+    }
+
+    /* See vkd3d_get_format_compatibility_list for rationale. */
+    if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            device->device_info.shader_image_atomic_int64_features.shaderImageInt64Atomics)
+    {
+        for (i = 0; i < list->format_count; i++)
+        {
+            if (list->vk_formats[i] == VK_FORMAT_R32G32_UINT)
+            {
+                vkd3d_format_compatibility_list_add_format(list, VK_FORMAT_R64_UINT);
+                break;
+            }
+        }
+    }
+
+    if (list->format_count < 2)
+        return false;
+
+    *vk_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+    /* Too many formats to expect compression, just use plain mutable. */
+    if (list->format_count == ARRAY_SIZE(list->vk_formats))
+        list->format_count = 0;
+
+    return list->format_count != 0;
+}
+
 static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *device,
-        const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_format_compatibility_list *out_list)
+        const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_format_compatibility_list *list, VkImageCreateFlags *vk_flags)
 {
     static const VkFormat r32_uav_formats[] = { VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT, VK_FORMAT_R32_SFLOAT };
     const struct vkd3d_format *format = vkd3d_get_format(device, desc->Format, false);
-    struct vkd3d_format_compatibility_list list;
     unsigned int i;
 
-    memset(&list, 0, sizeof(list));
+    memset(list, 0, sizeof(*list));
 
     if (desc->Format < device->format_compatibility_list_count)
-        list = device->format_compatibility_lists[desc->Format];
+        *list = device->format_compatibility_lists[desc->Format];
 
     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     {
@@ -264,7 +324,7 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
         if (format->byte_count == 4 && format->type == VKD3D_FORMAT_TYPE_TYPELESS)
         {
             for (i = 0; i < ARRAY_SIZE(r32_uav_formats); i++)
-                vkd3d_format_compatibility_list_add_format(&list, r32_uav_formats[i]);
+                vkd3d_format_compatibility_list_add_format(list, r32_uav_formats[i]);
         }
 
         /* 64-bit image atomics in D3D12 are done through RG32_UINT instead.
@@ -275,21 +335,22 @@ static bool vkd3d_get_format_compatibility_list(const struct d3d12_device *devic
          * mutable format. */
         if (device->device_info.shader_image_atomic_int64_features.shaderImageInt64Atomics)
         {
-            for (i = 0; i < list.format_count; i++)
+            for (i = 0; i < list->format_count; i++)
             {
-                if (list.vk_formats[i] == VK_FORMAT_R32G32_UINT)
+                if (list->vk_formats[i] == VK_FORMAT_R32G32_UINT)
                 {
-                    vkd3d_format_compatibility_list_add_format(&list, VK_FORMAT_R64_UINT);
+                    vkd3d_format_compatibility_list_add_format(list, VK_FORMAT_R64_UINT);
                     break;
                 }
             }
         }
     }
 
-    if (list.format_count < 2)
+    if (list->format_count < 2)
         return false;
 
-    *out_list = list;
+    assert(list->format_count <= ARRAY_SIZE(list->vk_formats));
+    *vk_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     return true;
 }
 
@@ -496,6 +557,7 @@ struct vkd3d_image_create_info
 static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
         struct vkd3d_image_create_info *create_info)
 {
     struct vkd3d_format_compatibility_list *compat_list = &create_info->format_compat_list;
@@ -560,16 +622,30 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
              * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_flags
              * For now, keep this as a specific workaround until we understand the problem scope better. */
             image_info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            memset(compat_list, 0, sizeof(*compat_list));
         }
-        else if (vkd3d_get_format_compatibility_list(device, desc, compat_list))
+        else
         {
-            format_list->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
-            format_list->pNext = image_info->pNext;
-            format_list->viewFormatCount = compat_list->format_count;
-            format_list->pViewFormats = compat_list->vk_formats;
+            bool requires_format_list = false;
+            if (num_castable_formats)
+            {
+                requires_format_list = vkd3d_get_castable_format_compatibility_list(device, desc,
+                        num_castable_formats, castable_formats, compat_list, &image_info->flags);
+            }
+            else
+            {
+                requires_format_list = vkd3d_get_format_compatibility_list(device, desc,
+                        compat_list, &image_info->flags);
+            }
 
-            image_info->pNext = format_list;
-            image_info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            if (requires_format_list)
+            {
+                format_list->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
+                format_list->pNext = image_info->pNext;
+                format_list->viewFormatCount = compat_list->format_count;
+                format_list->pViewFormats = compat_list->vk_formats;
+                image_info->pNext = format_list;
+            }
         }
     }
 
@@ -740,7 +816,9 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
 static HRESULT vkd3d_create_image(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
-        const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource, VkImage *vk_image)
+        const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        VkImage *vk_image)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_image_create_info create_info;
@@ -748,7 +826,7 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
     HRESULT hr;
 
     if (FAILED(hr = vkd3d_get_image_create_info(device, heap_properties,
-            heap_flags, desc, resource, &create_info)))
+            heap_flags, desc, resource, num_castable_formats, castable_formats, &create_info)))
         return hr;
 
     if ((vr = VK_CALL(vkCreateImage(device->vk_device, &create_info.image_info, NULL, vk_image))) < 0)
@@ -763,7 +841,9 @@ static size_t vkd3d_compute_resource_layouts_from_desc(struct d3d12_device *devi
         const D3D12_RESOURCE_DESC1 *desc, struct vkd3d_subresource_layout *layouts);
 
 HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
-        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_ALLOCATION_INFO *allocation_info)
+        const D3D12_RESOURCE_DESC1 *desc,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        D3D12_RESOURCE_ALLOCATION_INFO *allocation_info)
 {
     static const D3D12_HEAP_PROPERTIES heap_properties = {D3D12_HEAP_TYPE_DEFAULT};
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
@@ -772,10 +852,11 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     D3D12_RESOURCE_DESC1 validated_desc;
     VkMemoryRequirements2 requirements;
     VkDeviceSize target_alignment;
+    bool pad_allocation;
     HRESULT hr;
 
     assert(desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
-    assert(d3d12_resource_validate_desc(desc, device) == S_OK);
+    assert(d3d12_resource_validate_desc(desc, num_castable_formats, castable_formats, device) == S_OK);
 
     if (!desc->MipLevels)
     {
@@ -784,7 +865,9 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
         desc = &validated_desc;
     }
 
-    if (FAILED(hr = vkd3d_get_image_create_info(device, &heap_properties, 0, desc, NULL, &create_info)))
+    if (FAILED(hr = vkd3d_get_image_create_info(device, &heap_properties, 0, desc, NULL,
+            num_castable_formats, castable_formats,
+            &create_info)))
         return hr;
 
     requirement_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
@@ -815,10 +898,42 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
      * align the image ourselves. */
     target_alignment = desc->Alignment ? desc->Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
 
-    if (allocation_info->Alignment > target_alignment)
+    pad_allocation = allocation_info->Alignment > target_alignment &&
+            (allocation_info->Alignment > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+                    !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_REJECT_PADDED_SMALL_RESOURCE_ALIGNMENT));
+
+    if (pad_allocation)
     {
+        WARN("Padding allocation requirements. Requested alignment %u < %u (dim %u, %u x %u x %u, %u levels, %u samples, fmt #%x, flags #%x).\n",
+                (unsigned int)target_alignment, (unsigned int)allocation_info->Alignment,
+                desc->Dimension,
+                (unsigned int)desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->SampleDesc.Count,
+                desc->Format, desc->Flags);
+        /* On Polaris, 128k alignment can happen.
+         * Also, some resources which should require 4 KiB alignment may end up requiring 64 KiB on AMD.
+         * One example is mip-mapped BC textures. */
         allocation_info->SizeInBytes += allocation_info->Alignment - target_alignment;
         allocation_info->Alignment = target_alignment;
+    }
+    else if (allocation_info->Alignment > target_alignment)
+    {
+        /* It is unclear from tests and documentation if implementations are allowed to return 64k alignment here.
+         * There are three possible interpretations:
+         * - We are forced to support 4 KiB alignment. We must pad as necessary.
+         *   This however, breaks at least one game due to game bug.
+         *   It is also horrible for space efficiency since we will effectively be doubling resource sizes just to handle padding.
+         * - We can return 64 KiB alignment here. This has not been observed on native implementations so far.
+         * - We must fail the call. This has not been observed on native implementations so far.
+         *   The official sample in https://github.com/microsoft/DirectX-Graphics-Samples/blob/master/Samples/Desktop/D3D12SmallResources/src/D3D12SmallResources.cpp#L365,
+         *   suggests that one of these interpretations is possible. On error, UINT64_MAX / 64k is returned, which
+         *   means we cannot determine if we must trigger error, or bump the alignment requirement,
+         *   since 64k alignment can mean both things :(
+         * - Failing the call is the most reasonable thing to do, but some applications may rely on it always working,
+         *   so we cannot take this path by default.
+         *   Additionally, on CreatePlacedResource time,
+         *   we can verify that alignment requirements are met if placement offset is small. */
+        FIXME_ONCE("Asking for small resource alignment, but we cannot satisfy it without padding.\n");
+        return E_INVALIDARG;
     }
 
     return hr;
@@ -2183,9 +2298,113 @@ void d3d12_resource_promote_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE
     desc1->SamplerFeedbackMipRegion.Depth = 0;
 }
 
-HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3d12_device *device)
+static HRESULT d3d12_resource_validate_usage(const D3D12_RESOURCE_DESC1 *desc,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_device *device)
+{
+    /* Sentinel for format being supported at all. */
+    VkFormatFeatureFlags required_image_flags =
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    const struct vkd3d_format *format = NULL;
+    const struct vkd3d_format *cast_format;
+    VkFormatFeatureFlags total_flags = 0;
+    UINT i;
+
+    /* Validate that special usage flags are satisfied. */
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        required_image_flags |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        required_image_flags |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        required_image_flags |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (!(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        required_image_flags |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+    {
+        /* For DSV-enabled textures, UAV and RTV is banned. We only need to check if one format
+         * in the cast list potentially supports DSV. Oddly enough, we can add TYPELESS formats
+         * to the list, and it still counts for purposes of validation, but they don't count as being viewable,
+         * so we can end up in a situation where we can create a DSV texture that can never be viewed as DSV ...
+         * This is demonstrated by tests, and is likely a bug/quirk of the runtime, but applications
+         * may accidentally rely on this. */
+        format = vkd3d_format_from_d3d12_resource_desc(device, desc, 0);
+        if (!format)
+        {
+            WARN("Unrecognized format #%x.\n", desc->Format);
+            return E_INVALIDARG;
+        }
+        total_flags |= num_castable_formats ? format->vk_format_features : format->vk_format_features_castable;
+    }
+
+    /* Validate format cast list. */
+    for (i = 0; i < num_castable_formats; i++)
+    {
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        {
+            /* D3D12 runtime allows this, even if it is nonsensical. */
+            if (castable_formats[i] != DXGI_FORMAT_UNKNOWN)
+                return E_INVALIDARG;
+            continue;
+        }
+
+        cast_format = vkd3d_get_format(device, castable_formats[i],
+                !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+        if (!cast_format)
+        {
+            WARN("Unrecognized format #%x.\n", castable_formats[i]);
+            return E_INVALIDARG;
+        }
+        total_flags |= cast_format->vk_format_features;
+
+        if (vkd3d_format_is_compressed(format))
+        {
+            if (vkd3d_format_is_compressed(cast_format))
+            {
+                if (format->block_byte_count != cast_format->block_byte_count)
+                {
+                    WARN("Cannot cast to block format of different size.\n");
+                    return E_INVALIDARG;
+                }
+            }
+            else
+            {
+                if (format->block_byte_count != cast_format->byte_count)
+                {
+                    WARN("Cannot cast to non-compressed format with different size.\n");
+                    return E_INVALIDARG;
+                }
+            }
+        }
+        else if (vkd3d_format_is_compressed(cast_format))
+        {
+            WARN("Cannot cast uncompressed to block-compressed format.\n");
+            return E_INVALIDARG;
+        }
+        else if (format->byte_count != cast_format->byte_count)
+        {
+            WARN("Cannot cast to type of different bit width.\n");
+            return E_INVALIDARG;
+        }
+    }
+
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            (total_flags & required_image_flags) != required_image_flags)
+    {
+        WARN("Requested resource flags #%x, but no format in cast list supports it.\n",
+                desc->Flags);
+        return E_INVALIDARG;
+    }
+
+    return S_OK;
+}
+
+HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_device *device)
 {
     const struct vkd3d_format *format;
+    HRESULT hr;
 
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->SampleDesc.Count > 1)
     {
@@ -2271,6 +2490,9 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3
             return E_INVALIDARG;
     }
 
+    if (FAILED(hr = d3d12_resource_validate_usage(desc, num_castable_formats, castable_formats, device)))
+        return hr;
+
     return d3d12_validate_resource_flags(desc->Flags);
 }
 
@@ -2352,11 +2574,13 @@ static HRESULT d3d12_resource_validate_heap_properties(const D3D12_RESOURCE_DESC
 
 static HRESULT d3d12_resource_validate_create_info(const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_device *device)
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_device *device)
 {
     HRESULT hr;
 
-    if (FAILED(hr = d3d12_resource_validate_desc(desc, device)))
+    if (FAILED(hr = d3d12_resource_validate_desc(desc, num_castable_formats, castable_formats, device)))
         return hr;
 
     if (initial_state == D3D12_RESOURCE_STATE_RENDER_TARGET && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
@@ -2715,7 +2939,9 @@ static void d3d12_resource_destroy_and_release_device(struct d3d12_resource *res
     d3d12_device_release(device);
 }
 
-static HRESULT d3d12_resource_create_vk_resource(struct d3d12_resource *resource, struct d3d12_device *device)
+static HRESULT d3d12_resource_create_vk_resource(struct d3d12_resource *resource,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_device *device)
 {
     const D3D12_HEAP_PROPERTIES *heap_properties;
     HRESULT hr;
@@ -2737,7 +2963,9 @@ static HRESULT d3d12_resource_create_vk_resource(struct d3d12_resource *resource
             resource->desc.MipLevels = max_miplevel_count(&resource->desc);
 
         if (FAILED(hr = vkd3d_create_image(device, heap_properties,
-                D3D12_HEAP_FLAG_NONE, &resource->desc, resource, &resource->res.vk_image)))
+                D3D12_HEAP_FLAG_NONE, &resource->desc, resource,
+                num_castable_formats, castable_formats,
+                &resource->res.vk_image)))
             return hr;
     }
 
@@ -2792,7 +3020,9 @@ static size_t d3d12_resource_init_subresource_layouts(struct d3d12_resource *res
 static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags,
         const D3D12_RESOURCE_DESC1 *desc, const D3D12_HEAP_PROPERTIES *heap_properties,
         D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource)
 {
     const D3D12_RESOURCE_FLAGS high_priority_resource_flags =
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
@@ -2802,7 +3032,8 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_validate_create_info(desc,
-            heap_properties, initial_state, optimized_clear_value, device)))
+            heap_properties, initial_state, optimized_clear_value,
+            num_castable_formats, castable_formats, device)))
         return hr;
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
@@ -2903,14 +3134,18 @@ static void d3d12_resource_tag_debug_name(struct d3d12_resource *resource,
 
 HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, HANDLE shared_handle, struct d3d12_resource **resource)
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        HANDLE shared_handle, struct d3d12_resource **resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct d3d12_resource *object;
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION,
-            desc, heap_properties, heap_flags, initial_state, optimized_clear_value, &object)))
+            desc, heap_properties, heap_flags, initial_state, optimized_clear_value,
+            num_castable_formats, castable_formats,
+            &object)))
         return hr;
 
     if (d3d12_resource_is_texture(object))
@@ -2930,7 +3165,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         VkExportMemoryAllocateInfo export_info;
 #endif
 
-        if (FAILED(hr = d3d12_resource_create_vk_resource(object, device)))
+        if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
             goto fail;
 
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
@@ -3139,7 +3374,9 @@ static HRESULT d3d12_resource_validate_heap(const D3D12_RESOURCE_DESC1 *resource
 
 HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_allocate_memory_info allocate_info;
@@ -3160,7 +3397,9 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
                 heap->desc.Flags & ~(D3D12_HEAP_FLAG_DENY_BUFFERS |
                         D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES |
                         D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES),
-                initial_state, optimized_clear_value, NULL, resource)))
+                initial_state, optimized_clear_value,
+                num_castable_formats, castable_formats,
+                NULL, resource)))
         {
             ERR("Failed to create fallback committed resource.\n");
         }
@@ -3168,7 +3407,9 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
     }
 
     if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_PLACED, desc,
-            &heap->desc.Properties, heap->desc.Flags, initial_state, optimized_clear_value, &object)))
+            &heap->desc.Properties, heap->desc.Flags, initial_state, optimized_clear_value,
+            num_castable_formats, castable_formats,
+            &object)))
         return hr;
 
     /* https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap#remarks.
@@ -3177,11 +3418,27 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     if (d3d12_resource_is_texture(object))
     {
-        if (FAILED(hr = d3d12_resource_create_vk_resource(object, device)))
+        if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
             goto fail;
 
         /* Align manually. This works because we padded the required allocation size reported to the app. */
         VK_CALL(vkGetImageMemoryRequirements(device->vk_device, object->res.vk_image, &memory_requirements));
+
+        /* For SMALL_RESOURCE_PLACEMENT when we have workaround active,
+         * verify that application did in fact check alignment requirements.
+         * If application places 64k aligned, we will have made sure to leave room for padding below.
+         * See vkd3d_get_image_allocation_info() for details. */
+        if ((heap_offset & (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1)) &&
+                (heap_offset & (memory_requirements.alignment - 1)) &&
+                (vkd3d_config_flags & VKD3D_CONFIG_FLAG_REJECT_PADDED_SMALL_RESOURCE_ALIGNMENT))
+        {
+            /* Unclear if this is our bug or app bug, so FIXME seems appropriate. */
+            FIXME("Application attempts to place small aligned resource at heap offset %"PRIu64", but it is not possible (requirement %u).\n",
+                    heap_offset, (unsigned int)memory_requirements.alignment);
+            hr = E_INVALIDARG;
+            goto fail;
+        }
+
         heap_offset = align(heap->allocation.offset + heap_offset, memory_requirements.alignment) - heap->allocation.offset;
 
         if (heap_offset + memory_requirements.size > heap->allocation.resource.size)
@@ -3297,16 +3554,20 @@ fail:
 
 HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource)
 {
     struct d3d12_resource *object;
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_RESERVED, desc,
-            NULL, D3D12_HEAP_FLAG_NONE, initial_state, optimized_clear_value, &object)))
+            NULL, D3D12_HEAP_FLAG_NONE, initial_state, optimized_clear_value,
+            num_castable_formats, castable_formats,
+            &object)))
         return hr;
 
-    if (FAILED(hr = d3d12_resource_create_vk_resource(object, device)))
+    if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
         goto fail;
 
     if (FAILED(hr = d3d12_resource_init_sparse_info(object, device, &object->sparse)))
