@@ -357,3 +357,5 @@ decl_test(test_enhanced_barrier_castable_formats);
 decl_test(test_enhanced_barrier_castable_formats_buffer);
 decl_test(test_enhanced_barrier_castable_formats_validation);
 decl_test(test_enhanced_barrier_castable_dsv);
+decl_test(test_dstorage_decompression);
+decl_test(test_uninit_root_parameters);

@@ -162,6 +162,8 @@ struct vkd3d_vulkan_info
     bool NV_compute_shader_derivatives;
     bool NV_device_diagnostic_checkpoints;
     bool NV_device_generated_commands;
+    bool NV_shader_subgroup_partitioned;
+    bool NV_memory_decompression;
     /* VALVE extensions */
     bool VALVE_mutable_descriptor_type;
     bool VALVE_descriptor_set_host_mapping;
@@ -2386,7 +2388,6 @@ struct vkd3d_pipeline_bindings
     uint32_t dirty_flags; /* vkd3d_pipeline_dirty_flags */
 
     uint32_t descriptor_tables[D3D12_MAX_ROOT_COST];
-    uint64_t descriptor_table_active_mask;
     uint64_t descriptor_heap_dirty_mask;
 
     /* Needed when VK_KHR_push_descriptor is not available. */
@@ -2508,7 +2509,7 @@ struct vkd3d_rendering_info
 };
 
 /* ID3D12CommandListExt */
-typedef ID3D12GraphicsCommandListExt d3d12_command_list_vkd3d_ext_iface;
+typedef ID3D12GraphicsCommandListExt1 d3d12_command_list_vkd3d_ext_iface;
 
 struct d3d12_state_object;
 
@@ -2603,6 +2604,25 @@ struct d3d12_wbi_batch_state
     VkPipelineStageFlags stages[VKD3D_MAX_WBI_BATCH_SIZE];
     uint32_t values[VKD3D_MAX_WBI_BATCH_SIZE];
     size_t batch_len;
+};
+
+struct d3d12_rtas_batch_state
+{
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE build_type;
+
+    VkAccelerationStructureBuildGeometryInfoKHR *build_infos;
+    size_t build_info_count;
+    size_t build_info_size;
+
+    VkAccelerationStructureGeometryKHR *geometry_infos;
+    size_t geometry_info_count;
+    size_t geometry_info_size;
+
+    VkAccelerationStructureBuildRangeInfoKHR *range_infos;
+    size_t range_info_size;
+
+    const VkAccelerationStructureBuildRangeInfoKHR **range_ptrs;
+    size_t range_ptr_size;
 };
 
 union vkd3d_descriptor_heap_state
@@ -2736,6 +2756,7 @@ struct d3d12_command_list
 
     struct d3d12_transfer_batch_state transfer_batch;
     struct d3d12_wbi_batch_state wbi_batch;
+    struct d3d12_rtas_batch_state rtas_batch;
 
     struct vkd3d_private_store private_store;
 
@@ -3178,6 +3199,7 @@ enum vkd3d_breadcrumb_command_type
     VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_PATCH_COMPUTE,
     VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_PATCH_STATE_COMPUTE,
     VKD3D_BREADCRUMB_COMMAND_EXECUTE_INDIRECT_UNROLL_COMPUTE,
+    VKD3D_BREADCRUMB_COMMAND_DSTORAGE,
 };
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -3869,6 +3891,23 @@ HRESULT vkd3d_execute_indirect_ops_init(struct vkd3d_execute_indirect_ops *meta_
 void vkd3d_execute_indirect_ops_cleanup(struct vkd3d_execute_indirect_ops *meta_indirect_ops,
         struct d3d12_device *device);
 
+struct vkd3d_dstorage_emit_nv_memory_decompression_regions_args
+{
+    VkDeviceAddress control_va;
+    VkDeviceAddress src_buffer_va;
+    VkDeviceAddress dst_buffer_va;
+    VkDeviceAddress scratch_va;
+    uint32_t stream_count;
+    uint32_t stream_index;
+};
+
+struct vkd3d_dstorage_ops
+{
+    VkPipelineLayout vk_emit_nv_memory_decompression_regions_layout;
+    VkPipeline vk_emit_nv_memory_decompression_regions_pipeline;
+    VkPipeline vk_emit_nv_memory_decompression_workgroups_pipeline;
+};
+
 struct vkd3d_meta_ops_common
 {
     VkShaderModule vk_module_fullscreen_vs;
@@ -3886,6 +3925,7 @@ struct vkd3d_meta_ops
     struct vkd3d_predicate_ops predicate;
     struct vkd3d_execute_indirect_ops execute_indirect;
     struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
+    struct vkd3d_dstorage_ops dstorage;
 };
 
 HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device);
@@ -3961,6 +4001,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceShaderModuleIdentifierPropertiesEXT shader_module_identifier_properties;
     VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_properties;
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library_properties;
+    VkPhysicalDeviceMemoryDecompressionPropertiesNV memory_decompression_properties;
 
     VkPhysicalDeviceProperties2KHR properties2;
 
@@ -4001,6 +4042,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features;
     VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_device_memory_features;
     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT dynamic_rendering_unused_attachments_features;
+    VkPhysicalDeviceMemoryDecompressionFeaturesNV memory_decompression_features;
 
     VkPhysicalDeviceFeatures2 features2;
 
@@ -4499,6 +4541,72 @@ static inline struct d3d12_state_object *impl_from_ID3D12StateObject(ID3D12State
     return CONTAINING_RECORD(iface, struct d3d12_state_object, ID3D12StateObject_iface);
 }
 
+/* ID3D12MetaCommand */
+struct d3d12_meta_command;
+
+extern const GUID IID_META_COMMAND_DSTORAGE;
+
+/* These are not documented in any way, semantics and types
+ * were guessed based on native DirectStorage behaviour. */
+struct d3d12_meta_command_dstorage_query_in_args
+{
+    uint16_t unknown0;  /* always 1 */
+    uint16_t stream_count;
+    uint32_t unknown1;
+    uint64_t unknown2;
+};
+
+struct d3d12_meta_command_dstorage_query_out_args
+{
+    uint16_t unknown0;  /* always 1 */
+    uint16_t max_stream_count;
+    uint32_t unknown1;
+    uint64_t scratch_size;
+    uint64_t unknown2;
+};
+
+/* Upper limit on the number of tiles we can decompress in
+ * one call to the meta command. Corresponds to up to 4GB
+ * of decompressed data. */
+#define VKD3D_DSTORAGE_MAX_TILE_COUNT (0x10000u)
+
+struct d3d12_meta_command_dstorage_scratch_header
+{
+    /* Workgroup count for fallback shader */
+    VkDispatchIndirectCommand region_count;
+    /* Padding to ensure 8-byte alignment of region array */
+    uint32_t padding;
+    /* Region array to be interpreted by vkCmdDecompressMemoryNV */
+    VkDecompressMemoryRegionNV regions[VKD3D_DSTORAGE_MAX_TILE_COUNT];
+};
+
+typedef HRESULT (*d3d12_meta_command_create_proc)(struct d3d12_meta_command*, struct d3d12_device*, const void*, size_t);
+typedef void (*d3d12_meta_command_exec_proc)(struct d3d12_meta_command*, struct d3d12_command_list*, const void*, size_t);
+
+typedef ID3D12MetaCommand d3d12_meta_command_iface;
+
+struct d3d12_meta_command
+{
+    d3d12_meta_command_iface ID3D12MetaCommand_iface;
+    LONG refcount;
+
+    d3d12_meta_command_exec_proc init_proc;
+    d3d12_meta_command_exec_proc exec_proc;
+
+    struct d3d12_device *device;
+
+    struct vkd3d_private_store private_store;
+};
+
+struct d3d12_meta_command *impl_from_ID3D12MetaCommand(ID3D12MetaCommand *iface);
+
+void vkd3d_enumerate_meta_commands(struct d3d12_device *device, UINT *count, D3D12_META_COMMAND_DESC *output_descs);
+bool vkd3d_enumerate_meta_command_parameters(struct d3d12_device *device, REFGUID command_id,
+        D3D12_META_COMMAND_PARAMETER_STAGE stage, UINT *total_size, UINT *param_count,
+        D3D12_META_COMMAND_PARAMETER_DESC *param_descs);
+HRESULT d3d12_meta_command_create(struct d3d12_device *device, REFGUID guid,
+        const void *parameters, size_t parameter_size, struct d3d12_meta_command **meta_command);
+
 /* utils */
 enum vkd3d_format_type
 {
@@ -4753,28 +4861,18 @@ struct vkd3d_view_key
 struct vkd3d_view *vkd3d_view_map_create_view(struct vkd3d_view_map *view_map,
         struct d3d12_device *device, const struct vkd3d_view_key *key);
 
-/* Acceleration structure helpers. */
-struct vkd3d_acceleration_structure_build_info
-{
-    /* This is not a hard limit, just an arbitrary value which lets us avoid allocation for
-     * the common case. */
+/* This is not a hard limit, just an arbitrary value which lets us avoid allocation for
+ * the common case. */
 #define VKD3D_BUILD_INFO_STACK_COUNT 16
-    const struct VkAccelerationStructureBuildRangeInfoKHR *build_range_ptr_stack[VKD3D_BUILD_INFO_STACK_COUNT];
-    VkAccelerationStructureBuildRangeInfoKHR build_range_stack[VKD3D_BUILD_INFO_STACK_COUNT];
-    VkAccelerationStructureGeometryKHR geometries_stack[VKD3D_BUILD_INFO_STACK_COUNT];
-    const VkAccelerationStructureBuildRangeInfoKHR **build_range_ptrs;
-    uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
-    VkAccelerationStructureBuildRangeInfoKHR *build_ranges;
-    VkAccelerationStructureBuildGeometryInfoKHR build_info;
-    VkAccelerationStructureGeometryKHR *geometries;
-    uint32_t *primitive_counts;
-};
 
-void vkd3d_acceleration_structure_build_info_cleanup(
-        struct vkd3d_acceleration_structure_build_info *info);
-bool vkd3d_acceleration_structure_convert_inputs(const struct d3d12_device *device,
-        struct vkd3d_acceleration_structure_build_info *info,
+uint32_t vkd3d_acceleration_structure_get_geometry_count(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc);
+bool vkd3d_acceleration_structure_convert_inputs(const struct d3d12_device *device,
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+        VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+        VkAccelerationStructureGeometryKHR *geometry_infos,
+        VkAccelerationStructureBuildRangeInfoKHR *range_infos,
+        uint32_t *primitive_counts);
 void vkd3d_acceleration_structure_emit_postbuild_info(
         struct d3d12_command_list *list,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,

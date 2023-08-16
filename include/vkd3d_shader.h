@@ -364,6 +364,7 @@ enum vkd3d_shader_target_extension
     VKD3D_SHADER_TARGET_EXTENSION_MIN_PRECISION_IS_NATIVE_16BIT,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP16_DENORM_PRESERVE,
     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE,
+    VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_SUBGROUP_PARTITIONED_NV,
     VKD3D_SHADER_TARGET_EXTENSION_COUNT,
 };
 
@@ -407,6 +408,9 @@ enum vkd3d_shader_quirk
     /* Enforce a subgroup size of 32 or less. Can be used to work around
      * issues in shaders that are buggy with large subgroups. */
     VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32 = (1 << 10),
+
+    /* For shaders which are bugged when you opt-in to 16-bit. */
+    VKD3D_SHADER_QUIRK_FORCE_MIN16_AS_32BIT = (1 << 11),
 };
 
 struct vkd3d_shader_quirk_hash

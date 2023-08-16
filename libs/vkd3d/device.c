@@ -112,6 +112,8 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(NV_COMPUTE_SHADER_DERIVATIVES, NV_compute_shader_derivatives),
     VK_EXTENSION_COND(NV_DEVICE_DIAGNOSTIC_CHECKPOINTS, NV_device_diagnostic_checkpoints, VKD3D_CONFIG_FLAG_BREADCRUMBS | VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE),
     VK_EXTENSION(NV_DEVICE_GENERATED_COMMANDS, NV_device_generated_commands),
+    VK_EXTENSION(NV_SHADER_SUBGROUP_PARTITIONED, NV_shader_subgroup_partitioned),
+    VK_EXTENSION(NV_MEMORY_DECOMPRESSION, NV_memory_decompression),
     /* VALVE extensions */
     VK_EXTENSION(VALVE_MUTABLE_DESCRIPTOR_TYPE, VALVE_mutable_descriptor_type),
     VK_EXTENSION(VALVE_DESCRIPTOR_SET_HOST_MAPPING, VALVE_descriptor_set_host_mapping),
@@ -465,11 +467,14 @@ static const struct vkd3d_instance_application_meta application_override[] = {
      * This works okay with zerovram on first game boot, but not later, since this memory is guaranteed to be recycled.
      * Game also relies on indirectly modifying CBV root descriptors, which means we are forced to rely on RAW_VA_CBV.
      * It also relies on multi-dispatch indirect with state updates which is ... ye.
-     * Need another config flag to workaround that as well. */
+     * Need another config flag to workaround that as well.
+     * Poor loading times and performance with ReBar on some devices.
+     */
     { VKD3D_STRING_COMPARE_EXACT, "HaloInfinite.exe",
             VKD3D_CONFIG_FLAG_ZERO_MEMORY_WORKAROUNDS_COMMITTED_BUFFER_UAV | VKD3D_CONFIG_FLAG_FORCE_RAW_VA_CBV |
             VKD3D_CONFIG_FLAG_USE_HOST_IMPORT_FALLBACK | VKD3D_CONFIG_FLAG_PREALLOCATE_SRV_MIP_CLAMPS |
             VKD3D_CONFIG_FLAG_REQUIRES_COMPUTE_INDIRECT_TEMPLATES, 0 },
+            VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO | VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
     /* (1182900) Workaround amdgpu kernel bug with host memory import and concurrent submissions. */
     { VKD3D_STRING_COMPARE_EXACT, "APlagueTaleRequiem_x64.exe", VKD3D_CONFIG_FLAG_USE_HOST_IMPORT_FALLBACK, 0 },
     /* Shadow of the Tomb Raider (750920).
@@ -500,9 +505,9 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "re3.exe",
             VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
     { VKD3D_STRING_COMPARE_EXACT, "re4.exe",
-            VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
+            0, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
     { VKD3D_STRING_COMPARE_EXACT, "re4demo.exe",
-            VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
+            0, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
     { VKD3D_STRING_COMPARE_EXACT, "re7.exe",
             VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16, 0, VKD3D_APPLICATION_FEATURE_OVERRIDE_PROMOTE_DXR_TO_ULTIMATE },
     /* Control (870780).
@@ -581,6 +586,12 @@ static const struct vkd3d_shader_quirk_info re_quirks = {
     re_hashes, ARRAY_SIZE(re_hashes), 0,
 };
 
+/* There are lots of shaders which cause random flicker due to bad 16-bit behavior.
+ * These shaders really need 32-bit it seems to render properly, so just do that. */
+static const struct vkd3d_shader_quirk_info re4_quirks = {
+    re_hashes, ARRAY_SIZE(re_hashes), VKD3D_SHADER_QUIRK_FORCE_MIN16_AS_32BIT,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
@@ -597,7 +608,7 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Resident Evil 7 (418370) */
     { VKD3D_STRING_COMPARE_EXACT, "re7.exe", &re_quirks },
     /* Resident Evil 4 (2050650) */
-    { VKD3D_STRING_COMPARE_EXACT, "re4.exe", &re_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "re4.exe", &re4_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -1271,6 +1282,23 @@ static void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_d
     if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
         info->properties2.properties.limits.minStorageBufferOffsetAlignment = 4;
 
+    /* UE5 is broken and assumes that if mesh shaders are supported, barycentrics are also supported.
+     * This happens to be the case on RDNA2+ and Turing+ on Windows, but Mesa landed barycentrics long
+     * after mesh shaders, so Mesa 23.1 will often fail on boot for practically all UE5 content.
+     * The reasonable workaround is to disable mesh shaders unless barys are also supported.
+     * Nanite can work without mesh shaders.
+     * Unfortunately, we don't know of a robust way to detect UE5, so have to apply this globally. */
+    if (!device->vk_info.KHR_fragment_shader_barycentric && device->vk_info.EXT_mesh_shader)
+    {
+        WARN("Mesh shaders are supported, but not barycentrics. Disabling mesh shaders as a global UE5 workaround.\n");
+        device->vk_info.EXT_mesh_shader = false;
+        device->device_info.mesh_shader_features.meshShader = VK_FALSE;
+        device->device_info.mesh_shader_features.taskShader = VK_FALSE;
+        device->device_info.mesh_shader_features.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+        device->device_info.mesh_shader_features.meshShaderQueries = VK_FALSE;
+        device->device_info.mesh_shader_features.multiviewMeshShader = VK_FALSE;
+    }
+
     /* NV 525.x drivers and 530.x are affected by this bug. Not all users are affected,
      * but there is no known workaround for this. */
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS))
@@ -1609,6 +1637,14 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         info->dynamic_rendering_unused_attachments_features.sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
         vk_prepend_struct(&info->features2, &info->dynamic_rendering_unused_attachments_features);
+    }
+
+    if (vulkan_info->NV_memory_decompression)
+    {
+        info->memory_decompression_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_FEATURES_NV;
+        info->memory_decompression_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_DECOMPRESSION_PROPERTIES_NV;
+        vk_prepend_struct(&info->features2, &info->memory_decompression_features);
+        vk_prepend_struct(&info->properties2, &info->memory_decompression_properties);
     }
 
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
@@ -4165,6 +4201,48 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
+            TRACE("input_data_size = %u, input_data = %p, output_data_size = %u, output_data = %p.\n",
+                    data->QueryInputDataSizeInBytes, data->pQueryInputData, data->QueryOutputDataSizeInBytes,
+                    data->pQueryOutputData);
+
+            if ((data->QueryInputDataSizeInBytes && !data->pQueryInputData) ||
+                    (data->QueryOutputDataSizeInBytes && !data->pQueryOutputData))
+                return E_INVALIDARG;
+
+            if (!memcmp(&data->CommandId, &IID_META_COMMAND_DSTORAGE, sizeof(data->CommandId)))
+            {
+                /* It is not clear what any of these parameters do, but as of right now
+                 * it appears that only a single combination of parameters is supported. */
+                const struct d3d12_meta_command_dstorage_query_in_args *in_args = data->pQueryInputData;
+                struct d3d12_meta_command_dstorage_query_out_args *out_args = data->pQueryOutputData;
+
+                /* Passing an output parameter size larger than the structure,
+                 * is allowed but any excess bytes are not written. */
+                if (data->QueryInputDataSizeInBytes < sizeof(*in_args) || data->QueryOutputDataSizeInBytes < sizeof(*out_args))
+                {
+                    FIXME("Unexpected input/output sizes for DirectStorage meta command: %u, %u.\n",
+                            data->QueryInputDataSizeInBytes, data->QueryOutputDataSizeInBytes);
+                    return E_INVALIDARG;
+                }
+
+                memset(out_args, 0, sizeof(*out_args));
+
+                if (in_args->unknown2 == 1)
+                {
+                    out_args->unknown0 = 1;
+                    /* Limit stream count to something reasonable. Given that we have a hard limit
+                     * on the number of tiles we can process in one call, we should make it unlikely
+                     * for applications to hit that upper limit even if they try. */
+                    out_args->max_stream_count = min(256u, in_args->stream_count);
+                    /* Reserve data for the indirect tile count, then the memory region for
+                     * each tile, and finally a compute workgroup count for each stream. */
+                    out_args->scratch_size = sizeof(struct d3d12_meta_command_dstorage_scratch_header) +
+                            sizeof(VkDispatchIndirectCommand) * out_args->max_stream_count;
+                }
+
+                return S_OK;
+            }
+
             FIXME("Unsupported meta command %s.\n", debugstr_guid(&data->CommandId));
             return E_INVALIDARG;
         }
@@ -5986,12 +6064,14 @@ static void STDMETHODCALLTYPE d3d12_device_RemoveDevice(d3d12_device_iface *ifac
 static HRESULT STDMETHODCALLTYPE d3d12_device_EnumerateMetaCommands(d3d12_device_iface *iface,
         UINT *count, D3D12_META_COMMAND_DESC *descs)
 {
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+
     TRACE("iface %p, count %p, descs %p.\n", iface, count, descs);
 
     if (!count)
         return E_INVALIDARG;
 
-    *count = 0;
+    vkd3d_enumerate_meta_commands(device, count, descs);
     return S_OK;
 }
 
@@ -5999,20 +6079,33 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_EnumerateMetaCommandParameters(d3d
         REFGUID command_id, D3D12_META_COMMAND_PARAMETER_STAGE stage, UINT *total_size,
         UINT *param_count, D3D12_META_COMMAND_PARAMETER_DESC *param_descs)
 {
-    FIXME("iface %p, command_id %s, stage %u, total_size %p, param_count %p, param_descs %p stub!\n",
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+
+    TRACE("iface %p, command_id %s, stage %u, total_size %p, param_count %p, param_descs %p.\n",
             iface, debugstr_guid(command_id), stage, total_size, param_count, param_descs);
 
-    return E_NOTIMPL;
+    if (!vkd3d_enumerate_meta_command_parameters(device,
+            command_id, stage, total_size, param_count, param_descs))
+        return E_INVALIDARG;
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateMetaCommand(d3d12_device_iface *iface,
         REFGUID command_id, UINT node_mask, const void *param_data, SIZE_T param_size,
         REFIID iid, void **meta_command)
 {
-    FIXME("iface %p, command_id %s, node_mask %#x, param_data %p, param_size %lu, iid %s, meta_command %p stub!\n",
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    struct d3d12_meta_command *object;
+    HRESULT hr;
+
+    TRACE("iface %p, command_id %s, node_mask %#x, param_data %p, param_size %lu, iid %s, meta_command %p.\n",
             iface, debugstr_guid(command_id), node_mask, param_data, param_size, debugstr_guid(iid), meta_command);
 
-    return E_NOTIMPL;
+    if (FAILED(hr = d3d12_meta_command_create(device, command_id, param_data, param_size, &object)))
+        return hr;
+
+    return return_interface(&object->ID3D12MetaCommand_iface, &IID_ID3D12MetaCommand, iid, meta_command);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateStateObject(d3d12_device_iface *iface,
@@ -6037,9 +6130,14 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
 
+    VkAccelerationStructureGeometryKHR geometries_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    struct vkd3d_acceleration_structure_build_info build_info;
+    uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
+    VkAccelerationStructureBuildGeometryInfoKHR build_info;
     VkAccelerationStructureBuildSizesInfoKHR size_info;
+    VkAccelerationStructureGeometryKHR *geometries;
+    uint32_t *primitive_counts;
+    uint32_t geometry_count;
 
     TRACE("iface %p, desc %p, info %p!\n", iface, desc, info);
 
@@ -6050,21 +6148,32 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
         return;
     }
 
-    if (!vkd3d_acceleration_structure_convert_inputs(device, &build_info, desc))
+    geometry_count = vkd3d_acceleration_structure_get_geometry_count(desc);
+    primitive_counts = primitive_counts_stack;
+    geometries = geometries_stack;
+
+    if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
+    {
+        primitive_counts = vkd3d_malloc(geometry_count * sizeof(*primitive_counts));
+        geometries = vkd3d_malloc(geometry_count * sizeof(*geometries));
+    }
+
+    if (!vkd3d_acceleration_structure_convert_inputs(device,
+            desc, &build_info, geometries, NULL, primitive_counts))
     {
         ERR("Failed to convert inputs.\n");
         memset(info, 0, sizeof(*info));
-        return;
+        goto cleanup;
     }
+
+    build_info.pGeometries = geometries;
 
     memset(&size_info, 0, sizeof(size_info));
     size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 
     VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
-            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info.build_info,
-            build_info.primitive_counts, &size_info));
-
-    vkd3d_acceleration_structure_build_info_cleanup(&build_info);
+            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
+            primitive_counts, &size_info));
 
     info->ResultDataMaxSizeInBytes = size_info.accelerationStructureSize;
     info->ScratchDataSizeInBytes = size_info.buildScratchSize;
@@ -6073,6 +6182,14 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
     TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", info->ResultDataMaxSizeInBytes);
     TRACE("ScratchDatSizeInBytes: %"PRIu64".\n", info->ScratchDataSizeInBytes);
     TRACE("UpdateScratchDataSizeInBytes: %"PRIu64".\n", info->UpdateScratchDataSizeInBytes);
+
+cleanup:
+
+    if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
+    {
+        vkd3d_free(primitive_counts);
+        vkd3d_free(geometries);
+    }
 }
 
 static D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE d3d12_device_CheckDriverMatchingIdentifier(d3d12_device_iface *iface,
@@ -7579,6 +7696,13 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
             device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
                     VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_FP64_DENORM_PRESERVE;
         }
+    }
+
+    if (device->vk_info.NV_shader_subgroup_partitioned &&
+            (device->device_info.vulkan_1_1_properties.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_PARTITIONED_BIT_NV))
+    {
+        device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+                VKD3D_SHADER_TARGET_EXTENSION_SUPPORT_SUBGROUP_PARTITIONED_NV;
     }
 }
 
