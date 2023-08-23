@@ -8379,7 +8379,7 @@ static void vkd3d_dxbc_compiler_emit_imad(struct vkd3d_dxbc_compiler *compiler,
 static void vkd3d_dxbc_compiler_emit_udiv(struct vkd3d_dxbc_compiler *compiler,
         const struct vkd3d_shader_instruction *instruction)
 {
-    uint32_t type_id, val_id, src0_id, src1_id, condition_id, uint_max_id;
+    uint32_t type_id, src0_id, src1_id, condition_id, uint_max_id, quotient_val_id = 0, remainder_val_id = 0;
     struct vkd3d_spirv_builder *builder = &compiler->spirv_builder;
     const struct vkd3d_shader_dst_param *dst = instruction->dst;
     const struct vkd3d_shader_src_param *src = instruction->src;
@@ -8398,11 +8398,9 @@ static void vkd3d_dxbc_compiler_emit_udiv(struct vkd3d_dxbc_compiler *compiler,
         uint_max_id = vkd3d_dxbc_compiler_get_constant_uint_vector(compiler,
                 0xffffffff, component_count);
 
-        val_id = vkd3d_spirv_build_op_udiv(builder, type_id, src0_id, src1_id);
+        quotient_val_id = vkd3d_spirv_build_op_udiv(builder, type_id, src0_id, src1_id);
         /* The SPIR-V spec says: "The resulting value is undefined if Operand 2 is 0." */
-        val_id = vkd3d_spirv_build_op_select(builder, type_id, condition_id, val_id, uint_max_id);
-
-        vkd3d_dxbc_compiler_emit_store_dst(compiler, &dst[0], val_id);
+        quotient_val_id = vkd3d_spirv_build_op_select(builder, type_id, condition_id, quotient_val_id, uint_max_id);
     }
 
     if (dst[1].reg.type != VKD3DSPR_NULL)
@@ -8421,11 +8419,17 @@ static void vkd3d_dxbc_compiler_emit_udiv(struct vkd3d_dxbc_compiler *compiler,
                     0xffffffff, component_count);
         }
 
-        val_id = vkd3d_spirv_build_op_umod(builder, type_id, src0_id, src1_id);
+        remainder_val_id = vkd3d_spirv_build_op_umod(builder, type_id, src0_id, src1_id);
         /* The SPIR-V spec says: "The resulting value is undefined if Operand 2 is 0." */
-        val_id = vkd3d_spirv_build_op_select(builder, type_id, condition_id, val_id, uint_max_id);
-
-        vkd3d_dxbc_compiler_emit_store_dst(compiler, &dst[1], val_id);
+        remainder_val_id = vkd3d_spirv_build_op_select(builder, type_id, condition_id, remainder_val_id, uint_max_id);
+    }
+    if (dst[0].reg.type != VKD3DSPR_NULL) 
+    {        
+        vkd3d_dxbc_compiler_emit_store_dst(compiler, &dst[0], quotient_val_id);
+    }
+    if (dst[1].reg.type != VKD3DSPR_NULL)
+    {
+        vkd3d_dxbc_compiler_emit_store_dst(compiler, &dst[1], remainder_val_id);
     }
 }
 
@@ -11137,9 +11141,36 @@ static bool is_dcl_instruction(enum VKD3D_SHADER_INSTRUCTION_HANDLER handler_idx
             || handler_idx == VKD3DSIH_HS_DECLS;
 }
 
+static bool is_scope_generating_control_flow_instruction(enum VKD3D_SHADER_INSTRUCTION_HANDLER handler)
+{
+    /* Ignore continue, break, ret and any unconditional branches which don't logically generate new labels on their own.
+     * In some Xenia shaders, there is questionable back-to-back continue + continue, followed by break.
+     * If we've terminated a block, just ignore it.
+     * Technically, if there are if/endif pairs after a continue or break, it might be more
+     * correct to track shadow control flow scopes and ignore code until we pop out of the shadow stack,
+     * but this is silly and should only be considered if actually needed. */
+    switch (handler)
+    {
+        case VKD3DSIH_CASE:
+        case VKD3DSIH_DEFAULT:
+        case VKD3DSIH_ELSE:
+        case VKD3DSIH_ENDIF:
+        case VKD3DSIH_ENDLOOP:
+        case VKD3DSIH_ENDSWITCH:
+        case VKD3DSIH_IF:
+        case VKD3DSIH_LOOP:
+        case VKD3DSIH_SWITCH:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 int vkd3d_dxbc_compiler_handle_instruction(struct vkd3d_dxbc_compiler *compiler,
         const struct vkd3d_shader_instruction *instruction)
 {
+    const struct vkd3d_control_flow_info *cf_info;
     int ret = VKD3D_OK;
 
     if (!is_dcl_instruction(instruction->handler_idx) && !compiler->after_declarations_section)
@@ -11147,6 +11178,13 @@ int vkd3d_dxbc_compiler_handle_instruction(struct vkd3d_dxbc_compiler *compiler,
         compiler->after_declarations_section = true;
         vkd3d_dxbc_compiler_emit_main_prolog(compiler);
     }
+
+    /* Some Xenia shaders are broken and emit instructions after ending control flow in a block.
+     * Just ignore these instructions. */
+    cf_info = compiler->control_flow_depth
+            ? &compiler->control_flow_info[compiler->control_flow_depth - 1] : NULL;
+    if (cf_info && !cf_info->inside_block && !is_scope_generating_control_flow_instruction(instruction->handler_idx))
+        return VKD3D_OK;
 
     switch (instruction->handler_idx)
     {

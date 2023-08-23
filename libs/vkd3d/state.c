@@ -3422,6 +3422,14 @@ enum VkPrimitiveTopology vk_topology_from_d3d12_topology(D3D12_PRIMITIVE_TOPOLOG
             return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
             return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+            return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+        case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+            return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+            return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+            return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
         case D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST:
         case D3D_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST:
         case D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST:
@@ -6057,10 +6065,20 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
     }
 
     if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_REQUIRES_COMPUTE_INDIRECT_TEMPLATES) &&
-            !ENABLE_EXECUTE_INDIRECT_COMPUTE)
+            !device->device_info.device_generated_commands_compute_features_nv.deviceGeneratedCompute)
     {
         INFO("Forcing push UBO path for compute root parameters.\n");
         flags |= VKD3D_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO;
+    }
+
+    if (device->device_info.device_generated_commands_compute_features_nv.deviceGeneratedCompute &&
+            device->device_info.device_generated_commands_features_nv.deviceGeneratedCommands)
+    {
+        INFO("Enabling fast paths for advanced ExecuteIndirect() graphics and compute.\n");
+    }
+    else if (device->device_info.device_generated_commands_features_nv.deviceGeneratedCommands)
+    {
+        INFO("Enabling fast paths for advanced ExecuteIndirect() graphics.\n");
     }
 
     if (vkd3d_bindless_supports_mutable_type(device, flags))
