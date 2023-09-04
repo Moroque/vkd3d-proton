@@ -69,6 +69,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_FRAGMENT_SHADER_BARYCENTRIC, KHR_fragment_shader_barycentric),
     VK_EXTENSION(KHR_PRESENT_ID, KHR_present_id),
     VK_EXTENSION(KHR_PRESENT_WAIT, KHR_present_wait),
+    VK_EXTENSION(KHR_MAINTENANCE_5, KHR_maintenance5),
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
@@ -592,6 +593,17 @@ static const struct vkd3d_shader_quirk_info re4_quirks = {
     re_hashes, ARRAY_SIZE(re_hashes), VKD3D_SHADER_QUIRK_FORCE_MIN16_AS_32BIT,
 };
 
+static const struct vkd3d_shader_quirk_hash mhr_hashes[] = {
+    /* Shader is extremely sensitive to nocontract behavior.
+     * There some places where catastrophic cancellation occurs
+     * and one ULP difference is the difference between blown out bloom and not. */
+    { 0xd892f8024f52d3ca, VKD3D_SHADER_QUIRK_FORCE_NOCONTRACT_MATH },
+};
+
+static const struct vkd3d_shader_quirk_info mhr_quirks = {
+    mhr_hashes, ARRAY_SIZE(mhr_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Unreal Engine 4 */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
@@ -609,6 +621,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "re7.exe", &re_quirks },
     /* Resident Evil 4 (2050650) */
     { VKD3D_STRING_COMPARE_EXACT, "re4.exe", &re4_quirks },
+    /* Monster Hunter Rise (1446780) */
+    { VKD3D_STRING_COMPARE_EXACT, "MonsterHunterRise.exe", &mhr_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -695,7 +709,9 @@ static void vkd3d_instance_deduce_config_flags_from_environment(void)
         /* Disable caching so we can get full debug information when emitting labels. */
         vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS |
                 VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE |
-                VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_APP_CACHE_ONLY;
+                VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_APP_CACHE_ONLY |
+                VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV |
+                VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV;
     }
 }
 
@@ -1590,6 +1606,14 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     {
         info->present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
         vk_prepend_struct(&info->features2, &info->present_wait_features);
+    }
+
+    if (vulkan_info->KHR_maintenance5)
+    {
+        info->maintenance_5_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
+        info->maintenance_5_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
+        vk_prepend_struct(&info->features2, &info->maintenance_5_features);
+        vk_prepend_struct(&info->properties2, &info->maintenance_5_properties);
     }
 
     if (vulkan_info->EXT_descriptor_buffer)
@@ -4403,7 +4427,7 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_default(d3d
     {
         struct d3d12_desc_split d = d3d12_desc_decode_va(descriptor.ptr);
 
-        imageViewHandleInfo.imageView = d.view->info.view->vk_image_view;
+        imageViewHandleInfo.imageView = d.view->info.image.view->vk_image_view;
         imageViewHandleInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 
         vk_procs = &device->vk_procs;
