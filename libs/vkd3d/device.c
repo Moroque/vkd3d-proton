@@ -391,6 +391,7 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
      * - Pipeline layout limits on NV which are not relevant here.
      * - SPV_EXT_buffer_device_address shenanigans (need to fix glslang).
      * - Sample count mismatch in fallback copy shaders.
+     * - Threading error in WaitPresentKHR (false positive).
      */
     unsigned int i;
     static const uint32_t ignored_ids[] = {
@@ -401,6 +402,7 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
         0x8189c842u,
         0x3d492883u,
         0x1608dec0u,
+        0x141cb623u,
     };
 
     for (i = 0; i < ARRAY_SIZE(ignored_ids); i++)
@@ -408,9 +410,9 @@ static VkBool32 VKAPI_PTR vkd3d_debug_messenger_callback(
             return VK_FALSE;
 
     if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-        ERR("%s\n", debugstr_a(callback_data->pMessage));
+        ERR("%s\n", callback_data->pMessage);
     else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-        WARN("%s\n", debugstr_a(callback_data->pMessage));
+        WARN("%s\n", callback_data->pMessage);
 
     (void)userdata;
     (void)message_types;
@@ -529,7 +531,8 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION, 0 },
     /* Age of Wonders 4 (1669000). Extremely stuttery performance with ReBAR. */
     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
-    { VKD3D_STRING_COMPARE_HASH_EQUAL, "e89c09e4505d8d43",
+    /* Starfield (1716740) */
+    { VKD3D_STRING_COMPARE_EXACT, "Starfield.exe",
             VKD3D_CONFIG_FLAG_REQUIRES_COMPUTE_INDIRECT_TEMPLATES | VKD3D_CONFIG_FLAG_REJECT_PADDED_SMALL_RESOURCE_ALIGNMENT, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
@@ -7267,10 +7270,8 @@ static void d3d12_device_caps_init_feature_options11(struct d3d12_device *device
 static void d3d12_device_caps_init_feature_options12(struct d3d12_device *device)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS12 *options12 = &device->d3d12_caps.options12;
-
-    /* Exposing this without EnhancedBarrier is somewhat meaningless,
-     * but this allows us to implement the enhanced barrier API piecemeal. */
     options12->RelaxedFormatCastingSupported = TRUE;
+    options12->EnhancedBarriersSupported = TRUE;
 }
 
 static void d3d12_device_caps_init_feature_options13(struct d3d12_device *device)
