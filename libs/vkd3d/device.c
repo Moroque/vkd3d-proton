@@ -584,6 +584,13 @@ static const struct vkd3d_shader_quirk_hash re_hashes[] = {
     { 0xa100b53736f9c1bfull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
     /* RE2 and RE7 */
     { 0x1c4c8782b75c498bull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
+    /* Temporary driver workaround for RADV. See https://gitlab.freedesktop.org/mesa/mesa/-/issues/9852. */
+    /* This shader trips on Mesa 23.0.3. */
+    { 0xdb1593ced60da3f1ull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
+    /* This shader hangs on Mesa main. */
+    { 0x5784e9e2f7a76819ull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
+    /* This shader hangs on RDNA1 */
+    { 0x7b3cec4ba6d32cacull, VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS },
 };
 
 static const struct vkd3d_shader_quirk_info re_quirks = {
@@ -1347,10 +1354,12 @@ static void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_d
             /* RADV's internal memory cache implementation (pipelineCache == VK_NULL_HANDLE)
              * is currently bugged and will bloat indefinitely.
              * Can be removed when RADV is fixed. */
-            if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+            if (info->vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV &&
+                    info->properties2.properties.driverVersion < VK_MAKE_VERSION(23, 2, 0))
             {
                 if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE)
                 {
+                    INFO("Enabling CURB_MEMORY_PSO_CACHE workaround on RADV < 23.2.\n");
                     info->workarounds.force_dummy_pipeline_cache = true;
                 }
                 else if (info->properties2.properties.vendorID == 0x1002 &&
@@ -2856,8 +2865,12 @@ HRESULT d3d12_device_get_scratch_buffer(struct d3d12_device *device, enum vkd3d_
     struct vkd3d_scratch_buffer *candidate;
     size_t i;
 
-    if (min_size > VKD3D_SCRATCH_BUFFER_SIZE)
+    if (min_size > pool->block_size)
+    {
+        FIXME("Requesting scratch buffer kind %u larger than limit (%"PRIu64" > %u). Expect bad performance.\n",
+                kind, min_size, pool->block_size);
         return d3d12_device_create_scratch_buffer(device, kind, min_size, memory_types, scratch);
+    }
 
     pthread_mutex_lock(&device->mutex);
 
@@ -2877,7 +2890,7 @@ HRESULT d3d12_device_get_scratch_buffer(struct d3d12_device *device, enum vkd3d_
     }
 
     pthread_mutex_unlock(&device->mutex);
-    return d3d12_device_create_scratch_buffer(device, kind, VKD3D_SCRATCH_BUFFER_SIZE, memory_types, scratch);
+    return d3d12_device_create_scratch_buffer(device, kind, pool->block_size, memory_types, scratch);
 }
 
 void d3d12_device_return_scratch_buffer(struct d3d12_device *device, enum vkd3d_scratch_pool_kind kind,
@@ -2886,16 +2899,28 @@ void d3d12_device_return_scratch_buffer(struct d3d12_device *device, enum vkd3d_
     struct d3d12_device_scratch_pool *pool = &device->scratch_pools[kind];
     pthread_mutex_lock(&device->mutex);
 
-    if (scratch->allocation.resource.size == VKD3D_SCRATCH_BUFFER_SIZE &&
-            pool->scratch_buffer_count < VKD3D_SCRATCH_BUFFER_COUNT)
+    if (scratch->allocation.resource.size == pool->block_size &&
+            pool->scratch_buffer_count < pool->scratch_buffer_size)
     {
         pool->scratch_buffers[pool->scratch_buffer_count++] = *scratch;
+        if (pool->scratch_buffer_count > pool->high_water_mark)
+        {
+            pool->high_water_mark = pool->scratch_buffer_count;
+
+            /* Warn if we're starting to fill up. Potential performance issue afoot. */
+            if (pool->high_water_mark > pool->scratch_buffer_size / 2)
+            {
+                WARN("New high water mark: %u scratch buffers in flight for kind %u (%"PRIu64" bytes).\n",
+                        pool->high_water_mark, kind, pool->high_water_mark * pool->block_size);
+            }
+        }
         pthread_mutex_unlock(&device->mutex);
     }
     else
     {
         pthread_mutex_unlock(&device->mutex);
         d3d12_device_destroy_scratch_buffer(device, scratch);
+        WARN("Too many scratch buffers in flight, cannot recycle kind %u.\n", kind);
     }
 }
 
@@ -3506,11 +3531,8 @@ bool d3d12_device_is_uma(struct d3d12_device *device, bool *coherent)
 
 static HRESULT d3d12_device_get_format_support(struct d3d12_device *device, D3D12_FEATURE_DATA_FORMAT_SUPPORT *data)
 {
-    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkFormatFeatureFlags2 image_features;
-    VkFormatProperties3 properties3;
     const struct vkd3d_format *format;
-    VkFormatProperties2 properties;
 
     data->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
     data->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
@@ -3522,20 +3544,11 @@ static HRESULT d3d12_device_get_format_support(struct d3d12_device *device, D3D1
         return E_INVALIDARG;
     }
 
-    properties.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
-    properties.pNext = NULL;
+    image_features = format->vk_format_features;
 
-    properties3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
-    properties3.pNext = NULL;
-    vk_prepend_struct(&properties, &properties3);
-
-    VK_CALL(vkGetPhysicalDeviceFormatProperties2(device->vk_physical_device, format->vk_format, &properties));
-
-    image_features = properties3.linearTilingFeatures | properties3.optimalTilingFeatures;
-
-    if (properties.formatProperties.bufferFeatures)
+    if (format->vk_format_features_buffer)
         data->Support1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
-    if (properties.formatProperties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)
+    if (format->vk_format_features_buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)
         data->Support1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
     if (data->Format == DXGI_FORMAT_R16_UINT || data->Format == DXGI_FORMAT_R32_UINT)
         data->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
@@ -4219,8 +4232,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            data->TriangleFanSupported = FALSE;
-            data->DynamicIndexBufferStripCutSupported = FALSE;
+            *data = device->d3d12_caps.options15;
+
+            TRACE("TriangleFanSupported %u\n", data->TriangleFanSupported);
+            TRACE("DynamicIndexBufferStripCutSupported %u\n", data->DynamicIndexBufferStripCutSupported);
+
             return S_OK;
         }
 
@@ -4234,8 +4250,71 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            data->DynamicDepthBiasSupported = FALSE;
-            data->Reserved = FALSE;
+            *data = device->d3d12_caps.options16;
+
+            TRACE("DynamicDepthBiasSupported %u\n", data->DynamicDepthBiasSupported);
+            TRACE("GPUUploadHeapSupported %u\n", data->GPUUploadHeapSupported);
+
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS17:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS17 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            *data = device->d3d12_caps.options17;
+
+            TRACE("NonNormalizedCoordinateSamplersSupported %u\n", data->NonNormalizedCoordinateSamplersSupported);
+            TRACE("ManualWriteTrackingResourceSupported %u\n", data->ManualWriteTrackingResourceSupported);
+
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS18:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS18 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            *data = device->d3d12_caps.options18;
+
+            TRACE("RenderPassesValid %u\n", data->RenderPassesValid);
+
+            return S_OK;
+        }
+
+        case D3D12_FEATURE_D3D12_OPTIONS19:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS19 *data = feature_data;
+
+            if (feature_data_size != sizeof(*data))
+            {
+                WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
+            }
+
+            *data = device->d3d12_caps.options19;
+
+            TRACE("MismatchingOutputDimensionsSupported %u\n", data->MismatchingOutputDimensionsSupported);
+            TRACE("SupportedSampleCountsWithNoOutputs %#x\n", data->SupportedSampleCountsWithNoOutputs);
+            TRACE("PointSamplingAddressesNeverRoundUp %u\n", data->PointSamplingAddressesNeverRoundUp);
+            TRACE("RasterizerDesc2Supported %u\n", data->RasterizerDesc2Supported);
+            TRACE("NarrowQuadrilateralLinesSupported %u\n", data->NarrowQuadrilateralLinesSupported);
+            TRACE("AnisoFilterWithPointMipSupported %u\n", data->AnisoFilterWithPointMipSupported);
+            TRACE("MaxSamplerDescriptorHeapSize %u\n", data->MaxSamplerDescriptorHeapSize);
+            TRACE("MaxSamplerDescriptorHeapSizeWithStaticSamplers %u\n", data->MaxSamplerDescriptorHeapSizeWithStaticSamplers);
+            TRACE("MaxViewDescriptorHeapSize %u\n", data->MaxViewDescriptorHeapSize);
+
             return S_OK;
         }
 
@@ -7296,7 +7375,63 @@ static void d3d12_device_caps_init_feature_options14(struct d3d12_device *device
             device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7;
     options14->WriteableMSAATexturesSupported = device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7 &&
             device->device_info.features2.features.shaderStorageImageMultisample;
-    options14->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+    options14->IndependentFrontAndBackStencilRefMaskSupported = TRUE;
+}
+
+static void d3d12_device_caps_init_feature_options15(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS15 *options15 = &device->d3d12_caps.options15;
+
+    options15->TriangleFanSupported = TRUE;
+    options15->DynamicIndexBufferStripCutSupported = TRUE;
+}
+
+static void d3d12_device_caps_init_feature_options16(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 *options16 = &device->d3d12_caps.options16;
+
+    options16->DynamicDepthBiasSupported = TRUE;
+    options16->GPUUploadHeapSupported = FALSE;
+}
+
+static void d3d12_device_caps_init_feature_options17(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS17 *options17 = &device->d3d12_caps.options17;
+
+    options17->NonNormalizedCoordinateSamplersSupported = TRUE;
+    /* Debug-only feature, always reported to be false by the runtime */
+    options17->ManualWriteTrackingResourceSupported = FALSE;
+}
+
+static void d3d12_device_caps_init_feature_options18(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS18 *options18 = &device->d3d12_caps.options18;
+
+    /* We don't currently support render passes at all */
+    options18->RenderPassesValid = FALSE;
+}
+
+static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS19 *options19 = &device->d3d12_caps.options19;
+
+    /* We trivially support this by not validating resource types in rendering
+     * and computing renderArea to be the intersection of all bound views. */
+    options19->MismatchingOutputDimensionsSupported = TRUE;
+    /* Requires SampleCount > 1 for pipelinesm, not just ForcedSamplecount */
+    options19->SupportedSampleCountsWithNoOutputs = 0x1;
+    /* D3D12 expectations w.r.t. rounding match Vulkan spec */
+    options19->PointSamplingAddressesNeverRoundUp = TRUE;
+    options19->RasterizerDesc2Supported = TRUE;
+    /* We default to a line width of 1.0 anyway */
+    options19->NarrowQuadrilateralLinesSupported = TRUE;
+    options19->AnisoFilterWithPointMipSupported = TRUE;
+    /* Report legacy D3D12 limits for now. Increasing descriptor count limits
+     * would require changing changing descriptor set layouts, and more samplers
+     * need additional considerations w.r.t. Vulkan device limits. */
+    options19->MaxSamplerDescriptorHeapSize = 2048;
+    options19->MaxSamplerDescriptorHeapSizeWithStaticSamplers = 2048;
+    options19->MaxViewDescriptorHeapSize = 1000000;
 }
 
 static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
@@ -7658,6 +7793,11 @@ static void d3d12_device_caps_init(struct d3d12_device *device)
     d3d12_device_caps_init_feature_options12(device);
     d3d12_device_caps_init_feature_options13(device);
     d3d12_device_caps_init_feature_options14(device);
+    d3d12_device_caps_init_feature_options15(device);
+    d3d12_device_caps_init_feature_options16(device);
+    d3d12_device_caps_init_feature_options17(device);
+    d3d12_device_caps_init_feature_options18(device);
+    d3d12_device_caps_init_feature_options19(device);
     d3d12_device_caps_init_feature_level(device);
 
     d3d12_device_caps_override(device);
@@ -7866,6 +8006,31 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
 extern CONST_VTBL struct ID3D12DeviceExtVtbl d3d12_device_vkd3d_ext_vtbl;
 extern CONST_VTBL struct ID3D12DXVKInteropDeviceVtbl d3d12_dxvk_interop_device_vtbl;
 
+static void vkd3d_scratch_pool_init(struct d3d12_device *device)
+{
+    unsigned int i;
+
+    for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
+    {
+        device->scratch_pools[i].block_size = VKD3D_SCRATCH_BUFFER_SIZE_DEFAULT;
+        device->scratch_pools[i].scratch_buffer_size = VKD3D_SCRATCH_BUFFER_COUNT_DEFAULT;
+    }
+
+    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_REQUIRES_COMPUTE_INDIRECT_TEMPLATES) &&
+            device->device_info.device_generated_commands_compute_features_nv.deviceGeneratedCompute &&
+            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
+    {
+        /* DGCC preprocess buffers are gigantic on NV. Starfield requires 27 MB for 4096 dispatches ... */
+        device->scratch_pools[VKD3D_SCRATCH_POOL_KIND_INDIRECT_PREPROCESS].block_size =
+                VKD3D_SCRATCH_BUFFER_SIZE_DGCC_PREPROCESS_NV;
+    }
+
+    /* DGC tends to be pretty spammy with indirect buffers.
+     * Tuned for Starfield which is the "worst case scenario" so far. */
+    device->scratch_pools[VKD3D_SCRATCH_POOL_KIND_INDIRECT_PREPROCESS].scratch_buffer_size =
+            VKD3D_SCRATCH_BUFFER_COUNT_INDIRECT_PREPROCESS;
+}
+
 static HRESULT d3d12_device_init(struct d3d12_device *device,
         struct vkd3d_instance *instance, const struct vkd3d_device_create_info *create_info)
 {
@@ -7958,6 +8123,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_shader_debug_ring_init(&device->debug_ring, device)))
         goto out_cleanup_meta_ops;
+
+    vkd3d_scratch_pool_init(device);
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS)

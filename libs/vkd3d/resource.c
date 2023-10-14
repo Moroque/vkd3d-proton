@@ -518,32 +518,25 @@ static bool vkd3d_format_allows_shader_copies(DXGI_FORMAT dxgi_format)
     return false;
 }
 
-static bool vkd3d_format_check_usage_support(struct d3d12_device *device, VkFormat format, VkImageUsageFlags usage, VkImageTiling tiling)
+static bool vkd3d_format_needs_extended_usage(const struct vkd3d_format *format, VkImageUsageFlags usage)
 {
-    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkFormatFeatureFlags required_flags, supported_flags;
-    VkFormatProperties format_properties;
+    VkFormatFeatureFlags2 required_flags, supported_flags;
 
-    VK_CALL(vkGetPhysicalDeviceFormatProperties(device->vk_physical_device, format, &format_properties));
-
-    supported_flags = tiling == VK_IMAGE_TILING_LINEAR
-            ? format_properties.linearTilingFeatures
-            : format_properties.optimalTilingFeatures;
-
+    supported_flags = format->vk_format_features;
     required_flags = 0;
 
     if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
-        required_flags |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        required_flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
     if (usage & VK_IMAGE_USAGE_STORAGE_BIT)
-        required_flags |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        required_flags |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
     if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
-        required_flags |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+        required_flags |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
     if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-        required_flags |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        required_flags |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
-        required_flags |= VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        required_flags |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
-    return (supported_flags & required_flags) == required_flags;
+    return (supported_flags & required_flags) != required_flags;
 }
 
 struct vkd3d_image_create_info
@@ -698,7 +691,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     image_info->mipLevels = min(desc->MipLevels, max_miplevel_count(desc));
     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
-    image_info->tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info->tiling = format->vk_image_tiling;
     image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (sparse_resource)
@@ -761,7 +754,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     }
 
     if ((image_info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-            !vkd3d_format_check_usage_support(device, format->vk_format, image_info->usage, image_info->tiling))
+            vkd3d_format_needs_extended_usage(format, image_info->usage))
         image_info->flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
 
     if (sparse_resource)
@@ -798,17 +791,19 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     if (resource)
     {
-        if (heap_properties && is_cpu_accessible_heap(heap_properties))
+        /* Cases where we need to force images into GENERAL layout at all times.
+         * Read/WriteFromSubresource essentialy require simultaneous access. */
+        if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) ||
+                (image_info->tiling == VK_IMAGE_TILING_LINEAR) ||
+                (heap_properties && is_cpu_accessible_heap(heap_properties)))
         {
-            /* Required for ReadFrom/WriteToSubresource */
-            resource->flags |= VKD3D_RESOURCE_SIMULTANEOUS_ACCESS;
+            resource->flags |= VKD3D_RESOURCE_GENERAL_LAYOUT;
             resource->common_layout = VK_IMAGE_LAYOUT_GENERAL;
         }
         else
+        {
             resource->common_layout = vk_common_image_layout_from_d3d12_desc(device, desc);
-
-        if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
-            resource->flags |= VKD3D_RESOURCE_SIMULTANEOUS_ACCESS;
+        }
     }
 
     return S_OK;
@@ -3089,7 +3084,7 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
     {
         const UINT unsupported_flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-        object->flags |= VKD3D_RESOURCE_LINEAR_STAGING_COPY;
+        object->flags |= VKD3D_RESOURCE_LINEAR_STAGING_COPY | VKD3D_RESOURCE_GENERAL_LAYOUT;
         d3d12_resource_init_subresource_layouts(object, device);
 
         if ((desc->Flags & unsupported_flags) == unsupported_flags)
@@ -6277,7 +6272,7 @@ HRESULT d3d12_create_static_sampler(struct d3d12_device *device,
     sampler_desc.minLod = desc->MinLOD;
     sampler_desc.maxLod = desc->MaxLOD;
     sampler_desc.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    sampler_desc.unnormalizedCoordinates = VK_FALSE;
+    sampler_desc.unnormalizedCoordinates = !!(desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
 
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
         sampler_desc.borderColor = vk_static_border_color_from_d3d12(desc->BorderColor);
@@ -6328,7 +6323,7 @@ static HRESULT d3d12_create_sampler(struct d3d12_device *device,
     sampler_desc.minLod = desc->MinLOD;
     sampler_desc.maxLod = desc->MaxLOD;
     sampler_desc.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    sampler_desc.unnormalizedCoordinates = VK_FALSE;
+    sampler_desc.unnormalizedCoordinates = !!(desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
 
     if (sampler_desc.maxAnisotropy < 1.0f)
         sampler_desc.anisotropyEnable = VK_FALSE;

@@ -873,7 +873,7 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_LINEAR_STAGING_COPY    = (1u << 4),
     VKD3D_RESOURCE_EXTERNAL               = (1u << 5),
     VKD3D_RESOURCE_ACCELERATION_STRUCTURE = (1u << 6),
-    VKD3D_RESOURCE_SIMULTANEOUS_ACCESS    = (1u << 7),
+    VKD3D_RESOURCE_GENERAL_LAYOUT         = (1u << 7),
 };
 
 struct d3d12_sparse_image_region
@@ -999,8 +999,8 @@ static inline bool d3d12_resource_is_texture(const struct d3d12_resource *resour
 
 static inline VkImageLayout d3d12_resource_pick_layout(const struct d3d12_resource *resource, VkImageLayout layout)
 {
-    return resource->flags & (VKD3D_RESOURCE_LINEAR_STAGING_COPY | VKD3D_RESOURCE_SIMULTANEOUS_ACCESS) ?
-            resource->common_layout : layout;
+    return resource->flags & VKD3D_RESOURCE_GENERAL_LAYOUT ?
+            VK_IMAGE_LAYOUT_GENERAL : layout;
 }
 
 ULONG d3d12_resource_incref(struct d3d12_resource *resource);
@@ -1815,6 +1815,7 @@ enum vkd3d_dynamic_state_flag
     VKD3D_DYNAMIC_STATE_PATCH_CONTROL_POINTS  = (1 << 9),
     VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE    = (1 << 10),
     VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK    = (1 << 11),
+    VKD3D_DYNAMIC_STATE_DEPTH_BIAS            = (1 << 12),
 };
 
 struct vkd3d_shader_debug_ring_spec_constants
@@ -1964,7 +1965,9 @@ struct d3d12_graphics_pipeline_state
     VkPipelineRasterizationDepthClipStateCreateInfoEXT rs_depth_clip_info;
     VkPipelineRasterizationStateStreamCreateInfoEXT rs_stream_info;
 
-    uint32_t dynamic_state_flags; /* vkd3d_dynamic_state_flag */
+    /* vkd3d_dynamic_state_flag */
+    uint32_t explicit_dynamic_states;
+    uint32_t pipeline_dynamic_states;
 
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
@@ -2072,8 +2075,8 @@ struct d3d12_pipeline_state_desc
     D3D12_STREAM_OUTPUT_DESC stream_output;
     D3D12_BLEND_DESC blend_state;
     UINT sample_mask;
-    D3D12_RASTERIZER_DESC rasterizer_state;
-    D3D12_DEPTH_STENCIL_DESC1 depth_stencil_state;
+    D3D12_RASTERIZER_DESC2 rasterizer_state;
+    D3D12_DEPTH_STENCIL_DESC2 depth_stencil_state;
     D3D12_INPUT_LAYOUT_DESC input_layout;
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut_value;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE primitive_topology_type;
@@ -2277,8 +2280,11 @@ struct d3d12_descriptor_pool_cache
     size_t descriptor_pool_count;
 };
 
-#define VKD3D_SCRATCH_BUFFER_SIZE (1ull << 20)
-#define VKD3D_SCRATCH_BUFFER_COUNT (32u)
+#define VKD3D_SCRATCH_BUFFER_SIZE_DEFAULT (1ull << 20)
+#define VKD3D_SCRATCH_BUFFER_SIZE_DGCC_PREPROCESS_NV (32ull << 20)
+#define VKD3D_SCRATCH_BUFFER_COUNT_DEFAULT (32u)
+#define VKD3D_SCRATCH_BUFFER_COUNT_INDIRECT_PREPROCESS (128u)
+#define VKD3D_MAX_SCRATCH_BUFFER_COUNT (128u)
 
 struct vkd3d_scratch_buffer
 {
@@ -2414,9 +2420,23 @@ struct vkd3d_dynamic_state
     VkRect2D scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
 
     float blend_constants[4];
-    uint32_t stencil_reference;
-    uint32_t stencil_write_mask;
+
+    struct
+    {
+        uint8_t reference;
+        uint8_t write_mask;
+    } stencil_front, stencil_back;
+
     uint32_t dsv_plane_write_enable;
+
+    struct
+    {
+        float constant_factor;
+        float clamp;
+        float slope_factor;
+    } depth_bias;
+
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE index_buffer_strip_cut_value;
 
     float min_depth_bounds;
     float max_depth_bounds;
@@ -2647,6 +2667,46 @@ union vkd3d_descriptor_heap_state
     } sets;
 };
 
+struct d3d12_command_list_iteration_indirect_meta
+{
+    bool need_compute_to_indirect_barrier;
+    bool need_compute_to_cbv_barrier;
+};
+
+struct d3d12_command_list_iteration
+{
+    VkCommandBuffer vk_command_buffer;
+    VkCommandBuffer vk_init_commands;
+    struct d3d12_command_list_iteration_indirect_meta indirect_meta;
+};
+
+#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 2
+
+struct d3d12_command_list_sequence
+{
+    /* A command list can be split into multiple sequences of
+     * init -> command -> init -> command.
+     * This facilitates batching.
+     * Command stream can be split on e.g. INDIRECT_ARGUMENT resource state.
+     * This allows us to hoist predication CS streams nicely even in cases
+     * where INDIRECT_ARGUMENT barriers appear in the stream. */
+    struct d3d12_command_list_iteration iterations[VKD3D_MAX_COMMAND_LIST_SEQUENCES];
+    unsigned int iteration_count;
+    unsigned int active_non_inline_running_queries;
+    bool uses_dgc_compute_in_async_compute;
+
+    /* Emit normal commands here. */
+    VkCommandBuffer vk_command_buffer;
+    /* For various commands which should be thrown to the start of ID3D12CommandList. */
+    VkCommandBuffer vk_init_commands;
+    /* For any command which is sensitive to INDIRECT_ARGUMENT barriers.
+     * If equal to vk_command_buffer, it means it is not possible to split command buffers, and
+     * we must use vk_command_buffer with appropriate barriers. */
+    VkCommandBuffer vk_init_commands_post_indirect_barrier;
+
+    struct d3d12_command_list_iteration_indirect_meta *indirect_meta;
+};
+
 struct d3d12_command_list
 {
     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
@@ -2671,15 +2731,7 @@ struct d3d12_command_list
         bool is_dirty;
     } index_buffer;
 
-    struct
-    {
-        bool has_observed_transition_to_indirect;
-        bool has_emitted_indirect_to_compute_barrier;
-        bool has_emitted_indirect_to_compute_cbv_barrier;
-    } execute_indirect;
-
-    VkCommandBuffer vk_command_buffer;
-    VkCommandBuffer vk_init_commands;
+    struct d3d12_command_list_sequence cmd;
 
     struct d3d12_rtv_desc rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
     struct d3d12_rtv_desc dsv;
@@ -2691,8 +2743,14 @@ struct d3d12_command_list
 
     bool xfb_enabled;
 
-    bool predicate_enabled;
-    VkDeviceAddress predicate_va;
+    struct
+    {
+        VkDeviceAddress va;
+        VkBuffer vk_buffer;
+        VkDeviceSize vk_buffer_offset;
+        bool enabled_on_command_buffer;
+        bool fallback_enabled;
+    } predication;
 
     /* This is VK_NULL_HANDLE when we are no longer sure which pipeline to bind,
      * if this is NULL, we might need to lookup a pipeline key in order to bind the correct pipeline. */
@@ -2716,6 +2774,9 @@ struct d3d12_command_list
     struct d3d12_command_allocator *allocator;
     struct d3d12_device *device;
 
+    VkBuffer so_buffers[D3D12_SO_BUFFER_SLOT_COUNT];
+    VkDeviceSize so_buffer_offsets[D3D12_SO_BUFFER_SLOT_COUNT];
+    VkDeviceSize so_buffer_sizes[D3D12_SO_BUFFER_SLOT_COUNT];
     VkBuffer so_counter_buffers[D3D12_SO_BUFFER_SLOT_COUNT];
     VkDeviceSize so_counter_buffer_offsets[D3D12_SO_BUFFER_SLOT_COUNT];
 
@@ -2941,6 +3002,7 @@ struct d3d12_command_queue_submission_execute
 #endif
 
     bool debug_capture;
+    bool split_submission;
 };
 
 struct d3d12_command_queue_submission_bind_sparse
@@ -3055,7 +3117,7 @@ struct d3d12_command_signature
     LONG refcount;
 
     D3D12_COMMAND_SIGNATURE_DESC desc;
-    uint32_t argument_buffer_offset;
+    uint32_t argument_buffer_offset_for_command;
 
     /* Complex command signatures require some work to stamp out device generated commands. */
     union
@@ -3779,11 +3841,18 @@ HRESULT vkd3d_query_ops_init(struct vkd3d_query_ops *meta_query_ops,
 void vkd3d_query_ops_cleanup(struct vkd3d_query_ops *meta_query_ops,
         struct d3d12_device *device);
 
+struct vkd3d_predicate_command_direct_args_execute_indirect
+{
+    uint32_t max_commands;
+    uint32_t stride_words;
+};
+
 union vkd3d_predicate_command_direct_args
 {
     VkDispatchIndirectCommand dispatch;
     VkDrawIndirectCommand draw;
     VkDrawIndexedIndirectCommand draw_indexed;
+    struct vkd3d_predicate_command_direct_args_execute_indirect execute_indirect;
     uint32_t draw_count;
 };
 
@@ -3803,6 +3872,8 @@ enum vkd3d_predicate_command_type
     VKD3D_PREDICATE_COMMAND_DRAW_INDIRECT_COUNT,
     VKD3D_PREDICATE_COMMAND_DISPATCH,
     VKD3D_PREDICATE_COMMAND_DISPATCH_INDIRECT,
+    VKD3D_PREDICATE_COMMAND_EXECUTE_INDIRECT_GRAPHICS,
+    VKD3D_PREDICATE_COMMAND_EXECUTE_INDIRECT_COMPUTE,
     VKD3D_PREDICATE_COMMAND_COUNT
 };
 
@@ -4094,6 +4165,11 @@ struct d3d12_caps
     D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
     D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
     D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS15 options15;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS17 options17;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS18 options18;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19;
 
     D3D_FEATURE_LEVEL max_feature_level;
     D3D_SHADER_MODEL max_shader_model;
@@ -4141,8 +4217,11 @@ typedef ID3D12DXVKInteropDevice d3d12_dxvk_interop_device_iface;
 
 struct d3d12_device_scratch_pool
 {
-    struct vkd3d_scratch_buffer scratch_buffers[VKD3D_SCRATCH_BUFFER_COUNT];
+    struct vkd3d_scratch_buffer scratch_buffers[VKD3D_MAX_SCRATCH_BUFFER_COUNT];
     size_t scratch_buffer_count;
+    size_t scratch_buffer_size;
+    VkDeviceSize block_size;
+    unsigned int high_water_mark;
 };
 
 struct d3d12_device
@@ -4219,6 +4298,7 @@ struct d3d12_device
     struct vkd3d_descriptor_qa_global_info *descriptor_qa_global_info;
 #endif
     uint64_t shader_interface_key;
+    uint32_t device_has_dgc_templates;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
@@ -4676,12 +4756,15 @@ struct vkd3d_format
     enum vkd3d_format_type type;
     bool is_emulated;
     const struct vkd3d_format_footprint *plane_footprints;
-    /* Only includes format features explicitly for vk_format. */
-    VkFormatFeatureFlags vk_format_features;
+    VkImageTiling vk_image_tiling;
+    /* Only includes image format features explicitly for vk_format. */
+    VkFormatFeatureFlags2 vk_format_features;
     /* If the format is TYPELESS or relaxed castable (e.g. sRGB to UNORM),
      * the feature list includes all potential format features.
      * This will hold either just depth features or color features depending on which format query is used. */
-    VkFormatFeatureFlags vk_format_features_castable;
+    VkFormatFeatureFlags2 vk_format_features_castable;
+    /* Includes only buffer view features. */
+    VkFormatFeatureFlags2 vk_format_features_buffer;
 };
 
 static inline size_t vkd3d_format_get_data_offset(const struct vkd3d_format *format,
