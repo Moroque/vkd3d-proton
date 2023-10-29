@@ -140,6 +140,7 @@ void test_sampler_feedback_min_mip_level(void)
     D3D12_ROOT_PARAMETER rs_param[2];
     D3D12_HEAP_PROPERTIES heap_props;
     ID3D12DescriptorHeap *desc_heap;
+    ID3D12Resource *feedback_copy;
     struct test_context context;
     struct resource_readback rb;
     D3D12_RESOURCE_DESC1 desc;
@@ -360,6 +361,8 @@ void test_sampler_feedback_min_mip_level(void)
     desc.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
     hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback);
     ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback_copy);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
 
     ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heap));
     ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heap_cpu));
@@ -396,8 +399,11 @@ void test_sampler_feedback_min_mip_level(void)
         ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
     }
 
-    transition_resource_state(context.list, feedback, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve, 0, 0, 0, feedback, 0, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+    transition_resource_state(context.list, feedback, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    /* CopyResource is allowed, but not by region. */
+    ID3D12GraphicsCommandList_CopyResource(context.list, feedback_copy, feedback);
+    transition_resource_state(context.list, feedback_copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve, 0, 0, 0, feedback_copy, 0, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
     transition_resource_state(context.list, resolve, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     get_texture_readback_with_command_list(resolve, 0, &rb, context.queue, context.list);
 
@@ -412,6 +418,550 @@ void test_sampler_feedback_min_mip_level(void)
     }
 
     release_resource_readback(&rb);
+
+    ID3D12GraphicsCommandList1_Release(list1);
+    ID3D12Resource_Release(resource);
+    ID3D12Resource_Release(feedback);
+    ID3D12Resource_Release(feedback_copy);
+    ID3D12Resource_Release(resolve);
+    ID3D12DescriptorHeap_Release(desc_heap);
+    ID3D12DescriptorHeap_Release(desc_heap_cpu);
+    ID3D12Device8_Release(device8);
+    destroy_test_context(&context);
+#undef TEX_WIDTH
+#undef TEX_HEIGHT
+#undef MIP_REGION_WIDTH
+#undef MIP_REGION_HEIGHT
+#undef FEEDBACK_WIDTH
+#undef FEEDBACK_HEIGHT
+#undef TEX_MIP_LEVELS
+#undef TEX_MIP_LEVELS_VIEW
+}
+
+void test_sampler_feedback_decode_encode_min_mip(void)
+{
+#define MIP_REGIONS_X 10
+#define MIP_REGIONS_Y 8
+#define MIP_REGIONS_FLAT (MIP_REGIONS_X * MIP_REGIONS_Y)
+#define MIP_REGION_WIDTH 8
+#define MIP_REGION_HEIGHT 8
+#define TEX_WIDTH (MIP_REGIONS_X * MIP_REGION_WIDTH)
+#define TEX_HEIGHT (MIP_REGIONS_Y * MIP_REGION_HEIGHT)
+#define LAYERS 4
+    static const uint8_t reference_data[MIP_REGIONS_FLAT + 4 /* padding for array test */] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 31, 32, 0xff, 0xff, 0xff};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 features7;
+    ID3D12Resource *feedback_min_mip_single;
+    ID3D12Resource *feedback_min_mip_array;
+    struct test_context_desc context_desc;
+    ID3D12GraphicsCommandList1 *list1;
+    D3D12_HEAP_PROPERTIES heap_props;
+    struct test_context context;
+    struct resource_readback rb;
+    ID3D12Resource *resolve_tex;
+    ID3D12Resource *upload_tex;
+    D3D12_RESOURCE_DESC1 desc;
+    ID3D12Resource *resolve;
+    ID3D12Resource *upload;
+    ID3D12Device8 *device8;
+    unsigned int x, y, i;
+    unsigned int iter;
+    HRESULT hr;
+
+    /* Funnily enough, resolve cannot be called in a COMPUTE or COPY queue. */
+
+    memset(&context_desc, 0, sizeof(context_desc));
+    context_desc.no_pipeline = true;
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS7, &features7, sizeof(features7))) ||
+            features7.SamplerFeedbackTier < D3D12_SAMPLER_FEEDBACK_TIER_0_9)
+    {
+        skip("Sampler feedback not supported.\n");
+        destroy_test_context(&context);
+        return;
+    }
+
+    hr = ID3D12Device_QueryInterface(context.device, &IID_ID3D12Device8, (void **)&device8);
+    ok(SUCCEEDED(hr), "Failed to query Device8, hr #%x.\n", hr);
+    hr = ID3D12GraphicsCommandList_QueryInterface(context.list, &IID_ID3D12GraphicsCommandList1, (void **)&list1);
+    ok(SUCCEEDED(hr), "Failed to query GraphicsCommandList1, hr #%x.\n", hr);
+
+    memset(&desc, 0, sizeof(desc));
+    memset(&heap_props, 0, sizeof(heap_props));
+
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Width = TEX_WIDTH;
+    desc.Height = TEX_HEIGHT;
+    desc.MipLevels = 4;
+    desc.SamplerFeedbackMipRegion.Width = MIP_REGION_WIDTH;
+    desc.SamplerFeedbackMipRegion.Height = MIP_REGION_HEIGHT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    desc.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
+
+    desc.DepthOrArraySize = LAYERS;
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+            &desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback_min_mip_array);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+
+    desc.DepthOrArraySize = 1;
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+            &desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback_min_mip_single);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+
+    resolve = create_default_buffer(context.device, MIP_REGIONS_FLAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    resolve_tex = create_default_texture2d(context.device, MIP_REGIONS_X, MIP_REGIONS_Y, LAYERS, 1, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    /* Check that we can store arbitrary data here. */
+    upload = create_upload_buffer(context.device, MIP_REGIONS_FLAT, reference_data);
+    upload_tex = create_default_texture2d(context.device, MIP_REGIONS_X, MIP_REGIONS_Y, LAYERS, 1, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    /* BUFFER decode encode */
+    {
+        /* Spec carves out a special case for decoding / encoding with buffers. Must not be arrayed, and the docs seem to imply the buffer is tightly packed. */
+
+        /* NV and AMD are non-compliant here. Spec says that transcoding should be transitive, but it is a lossy process. AMD's behavior makes slightly more sense than NV here. */
+
+        /* DstX/Y for buffers are ignored on NV, but not AMD. Inherit NV behavior here, it's the only one that makes some kind of sense ... */
+        /* SrcRect is ignored on NV (spec says it's not allowed for MIN_MIP), but not AMD. Inherit NV behavior here. */
+        ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, feedback_min_mip_single, UINT_MAX, 0, 0, upload, 0, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_ENCODE_SAMPLER_FEEDBACK);
+        transition_resource_state(context.list, feedback_min_mip_single, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve, 0, 0, 0, feedback_min_mip_single, UINT_MAX, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+        transition_resource_state(context.list, resolve, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        get_buffer_readback_with_command_list(resolve, DXGI_FORMAT_R8_UINT, &rb, context.queue, context.list);
+        for (i = 0; i < MIP_REGIONS_FLAT; i++)
+        {
+            uint8_t value = get_readback_uint8(&rb, i, 0);
+            uint8_t expected;
+
+            expected = reference_data[i];
+
+            /* Arc behavior is also extremely unhinged. Just skip checking since it writes something to all 80 mip regions ... */
+
+            if (is_nvidia_windows_device(context.device))
+            {
+                static const uint8_t reference_data_nv[MIP_REGIONS_FLAT] = { 0, 1, 1, 1, 3, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1, 1, 1, 3, 0xff, 0xff, 0xff };
+                /* NV behavior is extremely weird and non-regular. There seems to be a mix of clamping and swapping out with 0xff going on ... */
+                expected = reference_data_nv[i];
+            }
+            else if (is_amd_windows_device(context.device))
+            {
+                /* This is more reasonable. Theory is that each mip region gets a u32 mask of accessed mip levels. No bits sets -> not accessed.
+                 * Anything outside the u32 range is considered not accessed. */
+                if (expected >= 32)
+                    expected = 0xff;
+            }
+            else
+            {
+                /* vkd3d-proton assumption. */
+                if (expected > 14)
+                    expected = 0xff;
+            }
+
+            bug_if(is_intel_windows_device(context.device))
+                ok(value == expected, "Value %u: Expected %u, got %u\n", i, expected, value);
+        }
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+    }
+
+    /* TEXTURE decode encode. Array mode is extremely weird. */
+    for (iter = 0; iter < 2; iter++)
+    {
+        D3D12_RECT rect = { 1, 0, 2, 3 };
+        D3D12_SUBRESOURCE_DATA subdata;
+        bool resolve_all = iter == 1;
+
+        subdata.RowPitch = MIP_REGIONS_X;
+        subdata.SlicePitch = MIP_REGIONS_FLAT;
+        for (i = 0; i < LAYERS; i++)
+        {
+            subdata.pData = reference_data + i;
+            upload_texture_data_base(upload_tex, &subdata, i, 1, context.queue, context.list);
+            reset_command_list(context.list, context.allocator);
+        }
+
+        transition_resource_state(context.list, upload_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+
+        /* On ENCODE, dst subresource is always -1, and source subresource index is the slice to resolve.
+         * This implies two rules: We can only resolve layer N to layer N, and layer size of source and dest must be the same. */
+
+        /* DstX and DstY are completely ignored here by both NV and AMD (wtf ...). The test assumes that DstX/DstY is interpreted as 0. */
+        /* SrcRect is also silently ignored on both NV and AMD. */
+        if (resolve_all)
+            ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, feedback_min_mip_array, UINT_MAX, 1, 1, upload_tex, UINT_MAX, &rect, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_ENCODE_SAMPLER_FEEDBACK);
+        else
+        {
+            for (i = 0; i < LAYERS; i++)
+                ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, feedback_min_mip_array, UINT_MAX, 1, 1, upload_tex, i, &rect, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_ENCODE_SAMPLER_FEEDBACK);
+        }
+
+        transition_resource_state(context.list, feedback_min_mip_array, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        transition_resource_state(context.list, upload_tex, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition_resource_state(context.list, resolve_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+
+        /* On DECODE, the rules flip, but here we test the other option which is to decode all array layers in one go. */
+        if (resolve_all)
+            ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve_tex, UINT_MAX, 2, 2, feedback_min_mip_array, UINT_MAX, &rect, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+        else
+        {
+            for (i = 0; i < LAYERS; i++)
+                ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve_tex, i, 2, 2, feedback_min_mip_array, UINT_MAX, &rect, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+        }
+
+        transition_resource_state(context.list, resolve_tex, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition_resource_state(context.list, feedback_min_mip_array, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+
+        for (i = 0; i < LAYERS; i++)
+        {
+            bool has_non_zero_result = false;
+
+            get_texture_readback_with_command_list(resolve_tex, i, &rb, context.queue, context.list);
+            for (y = 0; y < MIP_REGIONS_Y; y++)
+            {
+                for (x = 0; x < MIP_REGIONS_X; x++)
+                {
+                    uint8_t value = get_readback_uint8(&rb, x, y);
+                    uint8_t expected;
+
+                    /* Make sure that NV cannot pass with all zero degenerate output. */
+                    if (value)
+                        has_non_zero_result = true;
+
+                    expected = reference_data[y * MIP_REGIONS_X + x + i];
+
+                    if (is_nvidia_windows_device(context.device))
+                    {
+                        /* Input is irregular to the point of being impossible to test. Only test conservatively, either we get a lower mip level, or not used at all. */
+                        ok(value <= expected || value == 0xff, "Slice %u, value %u, %u: Expected %u, got %u\n", i, x, y, expected, value);
+                    }
+                    else
+                    {
+                        if (is_amd_windows_device(context.device))
+                        {
+                            /* This is more reasonable. Theory is that each mip region gets a u32 mask of accessed mip levels. No bits sets -> not accessed.
+                             * Anything outside the u32 range is considered not accessed. */
+                            if (expected >= 32)
+                                expected = 0xff;
+                        }
+                        else
+                        {
+                            /* vkd3d-proton assumption. */
+                            if (expected > 14)
+                                expected = 0xff;
+                        }
+
+                        /* Accessing individual layers is broken on AMD. :( */
+                        bug_if(is_intel_windows_device(context.device) || (!resolve_all && is_amd_windows_device(context.device)))
+                            ok(value == expected, "Slice %u, value %u, %u: Expected %u, got %u\n", i, x, y, expected, value);
+                    }
+                }
+            }
+
+            bug_if(is_intel_windows_device(context.device) || (!resolve_all && is_amd_windows_device(context.device)))
+                ok(has_non_zero_result, "Unexpected full zero result.\n");
+            release_resource_readback(&rb);
+            reset_command_list(context.list, context.allocator);
+        }
+    }
+
+    ID3D12GraphicsCommandList1_Release(list1);
+    ID3D12Resource_Release(feedback_min_mip_single);
+    ID3D12Resource_Release(feedback_min_mip_array);
+    ID3D12Resource_Release(upload_tex);
+    ID3D12Resource_Release(resolve);
+    ID3D12Resource_Release(resolve_tex);
+    ID3D12Resource_Release(upload);
+    ID3D12Device8_Release(device8);
+    destroy_test_context(&context);
+#undef MIP_REGIONS_X
+#undef MIP_REGIONS_Y
+#undef MIP_REGIONS_FLAT
+#undef MIP_REGION_WIDTH
+#undef MIP_REGION_HEIGHT
+#undef TEX_WIDTH
+#undef TEX_HEIGHT
+#undef LAYERS
+}
+
+void test_sampler_feedback_mip_used_region_level(void)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 features7;
+    D3D12_STATIC_SAMPLER_DESC static_sampler;
+    struct test_context_desc context_desc;
+    D3D12_DESCRIPTOR_RANGE desc_range[2];
+    ID3D12DescriptorHeap *desc_heap_cpu;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc;
+    ID3D12GraphicsCommandList1 *list1;
+    D3D12_ROOT_PARAMETER rs_param[2];
+    D3D12_HEAP_PROPERTIES heap_props;
+    ID3D12DescriptorHeap *desc_heap;
+    struct test_context context;
+    struct resource_readback rb;
+    D3D12_RESOURCE_DESC1 desc;
+    ID3D12Resource *resource;
+    ID3D12Resource *feedback;
+    ID3D12Resource *resolve;
+    ID3D12Device8 *device8;
+    unsigned int x, y, i;
+    HRESULT hr;
+
+    static const BYTE cs_code[] =
+    {
+#if 0
+    Texture2D<float> T : register(t0);
+    SamplerState S : register(s0);
+    FeedbackTexture2D<SAMPLER_FEEDBACK_MIP_REGION_USED> FB : register(u0);
+
+    cbuffer Cbuf : register(b0) { float2 uv; float level; };
+
+    [numthreads(1, 1, 1)]
+    void main()
+    {
+            FB.WriteSamplerFeedbackLevel(T, S, uv, level);
+    }
+#endif
+        0x44, 0x58, 0x42, 0x43, 0x26, 0x0c, 0x0c, 0xde, 0xd9, 0xe3, 0xf4, 0xb6, 0xd2, 0x79, 0xce, 0x60, 0x39, 0x07, 0xa2, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x1c, 0x07, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+        0x38, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x18, 0x01, 0x00, 0x00, 0x34, 0x01, 0x00, 0x00, 0x53, 0x46, 0x49, 0x30, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49, 0x53, 0x47, 0x31, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x4f, 0x53, 0x47, 0x31, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x50, 0x53, 0x56, 0x30, 0xa8, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x41, 0x53, 0x48, 0x14, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x19, 0x0e, 0x31, 0x85, 0x97, 0xa6, 0x6b, 0xb3, 0x82, 0x97, 0xef, 0xf9, 0x23, 0x34, 0x3d, 0x36, 0x44, 0x58, 0x49, 0x4c, 0xe0, 0x05, 0x00, 0x00, 0x65, 0x00, 0x05, 0x00,
+        0x78, 0x01, 0x00, 0x00, 0x44, 0x58, 0x49, 0x4c, 0x05, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0xc8, 0x05, 0x00, 0x00, 0x42, 0x43, 0xc0, 0xde, 0x21, 0x0c, 0x00, 0x00, 0x6f, 0x01, 0x00, 0x00,
+        0x0b, 0x82, 0x20, 0x00, 0x02, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x07, 0x81, 0x23, 0x91, 0x41, 0xc8, 0x04, 0x49, 0x06, 0x10, 0x32, 0x39, 0x92, 0x01, 0x84, 0x0c, 0x25, 0x05, 0x08, 0x19,
+        0x1e, 0x04, 0x8b, 0x62, 0x80, 0x14, 0x45, 0x02, 0x42, 0x92, 0x0b, 0x42, 0xa4, 0x10, 0x32, 0x14, 0x38, 0x08, 0x18, 0x4b, 0x0a, 0x32, 0x52, 0x88, 0x48, 0x90, 0x14, 0x20, 0x43, 0x46, 0x88, 0xa5,
+        0x00, 0x19, 0x32, 0x42, 0xe4, 0x48, 0x0e, 0x90, 0x91, 0x22, 0xc4, 0x50, 0x41, 0x51, 0x81, 0x8c, 0xe1, 0x83, 0xe5, 0x8a, 0x04, 0x29, 0x46, 0x06, 0x51, 0x18, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+        0x1b, 0x88, 0xe0, 0xff, 0xff, 0xff, 0xff, 0x07, 0x40, 0xda, 0x60, 0x08, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x00, 0x12, 0x50, 0x01, 0x00, 0x00, 0x00, 0x49, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x13, 0x82, 0x60, 0x42, 0x20, 0x00, 0x00, 0x00, 0x89, 0x20, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x32, 0x22, 0x48, 0x09, 0x20, 0x64, 0x85, 0x04, 0x93, 0x22, 0xa4, 0x84, 0x04, 0x93, 0x22, 0xe3,
+        0x84, 0xa1, 0x90, 0x14, 0x12, 0x4c, 0x8a, 0x8c, 0x0b, 0x84, 0xa4, 0x4c, 0x10, 0x6c, 0x23, 0x00, 0x25, 0x00, 0x14, 0xe6, 0x08, 0xc0, 0x60, 0x8e, 0x00, 0x21, 0x72, 0xcf, 0x70, 0xf9, 0x13, 0xf6,
+        0x10, 0x92, 0x1f, 0x02, 0xcd, 0xb0, 0x10, 0x28, 0x28, 0x33, 0x00, 0x45, 0x01, 0xc3, 0x18, 0x73, 0xce, 0x39, 0x87, 0xd0, 0x51, 0xc3, 0xe5, 0x4f, 0xd8, 0x43, 0x48, 0x3e, 0xb7, 0x51, 0xc5, 0x4a,
+        0x4c, 0x7e, 0x71, 0xdb, 0x88, 0x38, 0xe7, 0x9c, 0x42, 0xa8, 0x61, 0x06, 0xad, 0x39, 0x82, 0xa0, 0x18, 0x66, 0x90, 0x31, 0x1a, 0xb9, 0x81, 0x80, 0x99, 0xc2, 0x60, 0x1c, 0xd8, 0x21, 0x1c, 0xe6,
+        0x61, 0x1e, 0xdc, 0x80, 0x16, 0xca, 0x01, 0x1f, 0xe8, 0xa1, 0x1e, 0xe4, 0xa1, 0x1c, 0xe4, 0x80, 0x14, 0xf8, 0xc0, 0x1c, 0xd8, 0xe1, 0x1d, 0xc2, 0x81, 0x1e, 0xfc, 0x40, 0x0f, 0xf4, 0xa0, 0x1d,
+        0xd2, 0x01, 0x1e, 0xe6, 0xe1, 0x17, 0xe8, 0x21, 0x1f, 0xe0, 0xa1, 0x1c, 0x50, 0x30, 0x66, 0xb2, 0xc6, 0x81, 0x1d, 0xc2, 0x61, 0x1e, 0xe6, 0xc1, 0x0d, 0x68, 0xa1, 0x1c, 0xf0, 0x81, 0x1e, 0xea,
+        0x41, 0x1e, 0xca, 0x41, 0x0e, 0x48, 0x81, 0x0f, 0xcc, 0x81, 0x1d, 0xde, 0x21, 0x1c, 0xe8, 0xc1, 0x0f, 0x90, 0x70, 0x22, 0xc9, 0x99, 0xb4, 0x71, 0x60, 0x87, 0x70, 0x98, 0x87, 0x79, 0x70, 0x03,
+        0x53, 0x28, 0x87, 0x72, 0x20, 0x07, 0x71, 0x08, 0x87, 0x71, 0x58, 0x07, 0x5a, 0x28, 0x07, 0x7c, 0xa0, 0x87, 0x7a, 0x90, 0x87, 0x72, 0x90, 0x03, 0x52, 0xe0, 0x83, 0x38, 0xf0, 0x03, 0x14, 0x0c,
+        0xa2, 0xc3, 0x08, 0xc2, 0x71, 0x04, 0x17, 0x50, 0x05, 0x12, 0xec, 0xa1, 0x7b, 0x93, 0x34, 0x45, 0x94, 0x30, 0xf9, 0x2c, 0xc0, 0x3c, 0x0b, 0x11, 0xb1, 0x13, 0x30, 0x11, 0x28, 0x18, 0x94, 0x01,
+        0x13, 0x14, 0x72, 0xc0, 0x87, 0x74, 0x60, 0x87, 0x36, 0x68, 0x87, 0x79, 0x68, 0x03, 0x72, 0xc0, 0x87, 0x0d, 0xaf, 0x50, 0x0e, 0x6d, 0xd0, 0x0e, 0x7a, 0x50, 0x0e, 0x6d, 0x00, 0x0f, 0x7a, 0x30,
+        0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x71, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x78, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x71, 0x60, 0x07, 0x7a,
+        0x30, 0x07, 0x72, 0xd0, 0x06, 0xe9, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x76, 0x40, 0x07, 0x7a, 0x60, 0x07, 0x74, 0xd0, 0x06, 0xe6, 0x10, 0x07, 0x76, 0xa0, 0x07,
+        0x73, 0x20, 0x07, 0x6d, 0x60, 0x0e, 0x73, 0x20, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xd0, 0x06, 0xe6, 0x60, 0x07, 0x74, 0xa0, 0x07, 0x76, 0x40, 0x07, 0x6d, 0xe0, 0x0e, 0x78, 0xa0, 0x07, 0x71, 0x60,
+        0x07, 0x7a, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x76, 0x40, 0x07, 0x43, 0x9e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x3c, 0x08, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x0c, 0x79, 0x16, 0x20, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0xf2, 0x38, 0x40, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x05,
+        0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x32, 0x1e, 0x98, 0x14, 0x19, 0x11, 0x4c, 0x90, 0x8c, 0x09, 0x26, 0x47, 0xc6, 0x04, 0x43, 0x1a, 0x25, 0x50, 0x0a, 0xe5, 0x50, 0x0c, 0x23, 0x00,
+        0x45, 0x50, 0x12, 0x25, 0x52, 0x18, 0x85, 0x40, 0x6d, 0x04, 0x80, 0xe6, 0x0c, 0x00, 0xd5, 0x19, 0x00, 0xc2, 0x33, 0x00, 0xa4, 0x67, 0x00, 0x00, 0x79, 0x18, 0x00, 0x00, 0x47, 0x00, 0x00, 0x00,
+        0x1a, 0x03, 0x4c, 0x90, 0x46, 0x02, 0x13, 0x44, 0x8f, 0x0c, 0x6f, 0xec, 0xed, 0x4d, 0x0c, 0x24, 0xc6, 0xe5, 0xc6, 0x45, 0x46, 0x26, 0x46, 0xc6, 0x85, 0x06, 0x06, 0x04, 0xa5, 0x0c, 0x86, 0x66,
+        0xc6, 0x8c, 0x26, 0x2c, 0x46, 0x26, 0x65, 0x43, 0x10, 0x4c, 0x10, 0x06, 0x62, 0x82, 0x30, 0x14, 0x1b, 0x84, 0x81, 0x98, 0x20, 0x0c, 0xc6, 0x06, 0x61, 0x30, 0x28, 0x8c, 0xcd, 0x4d, 0x10, 0x86,
+        0x63, 0xc3, 0x80, 0x24, 0xc4, 0x04, 0x61, 0x40, 0x26, 0x08, 0xd3, 0x43, 0x60, 0x82, 0x30, 0x24, 0x13, 0x84, 0x41, 0xd9, 0x20, 0x2c, 0xcf, 0x86, 0x64, 0x61, 0x9a, 0x65, 0x19, 0x9c, 0x05, 0xda,
+        0x10, 0x44, 0x13, 0x84, 0x0a, 0x9a, 0x20, 0x0c, 0xcb, 0x04, 0xa1, 0x71, 0x36, 0x08, 0xce, 0xb0, 0x61, 0x59, 0xa6, 0x66, 0x59, 0x06, 0xaa, 0xaa, 0x2a, 0x6b, 0x43, 0x70, 0x4d, 0x10, 0xb0, 0x68,
+        0x82, 0x30, 0x30, 0x1b, 0x90, 0x25, 0x6b, 0x96, 0x65, 0xd0, 0x80, 0x0d, 0xc1, 0x36, 0x41, 0xd0, 0xa4, 0x0d, 0xc8, 0xd2, 0x35, 0xcb, 0x32, 0x2c, 0xc0, 0x86, 0xc0, 0xdb, 0x40, 0x48, 0x18, 0xf7,
+        0x4d, 0x10, 0x04, 0x80, 0x44, 0x5b, 0x58, 0x9a, 0xdb, 0x04, 0x61, 0x68, 0x36, 0x0c, 0xc3, 0x30, 0x6c, 0x10, 0xc6, 0x80, 0x0c, 0x36, 0x14, 0x61, 0x20, 0x06, 0x00, 0x18, 0x94, 0x41, 0x15, 0x36,
+        0x36, 0xbb, 0x36, 0x97, 0x34, 0xb2, 0x32, 0x37, 0xba, 0x29, 0x41, 0x50, 0x85, 0x0c, 0xcf, 0xc5, 0xae, 0x4c, 0x6e, 0x2e, 0xed, 0xcd, 0x6d, 0x4a, 0x40, 0x34, 0x21, 0xc3, 0x73, 0xb1, 0x0b, 0x63,
+        0xb3, 0x2b, 0x93, 0x9b, 0x12, 0x18, 0x75, 0xc8, 0xf0, 0x5c, 0xe6, 0xd0, 0xc2, 0xc8, 0xca, 0xe4, 0x9a, 0xde, 0xc8, 0xca, 0xd8, 0xa6, 0x04, 0x49, 0x19, 0x32, 0x3c, 0x17, 0xb9, 0xb2, 0xb9, 0xb7,
+        0x3a, 0xb9, 0xb1, 0xb2, 0xb9, 0x29, 0xc1, 0x57, 0x87, 0x0c, 0xcf, 0xa5, 0xcc, 0x8d, 0x4e, 0x2e, 0x0f, 0xea, 0x2d, 0xcd, 0x8d, 0x6e, 0x6e, 0x4a, 0x50, 0x06, 0x00, 0x00, 0x79, 0x18, 0x00, 0x00,
+        0x49, 0x00, 0x00, 0x00, 0x33, 0x08, 0x80, 0x1c, 0xc4, 0xe1, 0x1c, 0x66, 0x14, 0x01, 0x3d, 0x88, 0x43, 0x38, 0x84, 0xc3, 0x8c, 0x42, 0x80, 0x07, 0x79, 0x78, 0x07, 0x73, 0x98, 0x71, 0x0c, 0xe6,
+        0x00, 0x0f, 0xed, 0x10, 0x0e, 0xf4, 0x80, 0x0e, 0x33, 0x0c, 0x42, 0x1e, 0xc2, 0xc1, 0x1d, 0xce, 0xa1, 0x1c, 0x66, 0x30, 0x05, 0x3d, 0x88, 0x43, 0x38, 0x84, 0x83, 0x1b, 0xcc, 0x03, 0x3d, 0xc8,
+        0x43, 0x3d, 0x8c, 0x03, 0x3d, 0xcc, 0x78, 0x8c, 0x74, 0x70, 0x07, 0x7b, 0x08, 0x07, 0x79, 0x48, 0x87, 0x70, 0x70, 0x07, 0x7a, 0x70, 0x03, 0x76, 0x78, 0x87, 0x70, 0x20, 0x87, 0x19, 0xcc, 0x11,
+        0x0e, 0xec, 0x90, 0x0e, 0xe1, 0x30, 0x0f, 0x6e, 0x30, 0x0f, 0xe3, 0xf0, 0x0e, 0xf0, 0x50, 0x0e, 0x33, 0x10, 0xc4, 0x1d, 0xde, 0x21, 0x1c, 0xd8, 0x21, 0x1d, 0xc2, 0x61, 0x1e, 0x66, 0x30, 0x89,
+        0x3b, 0xbc, 0x83, 0x3b, 0xd0, 0x43, 0x39, 0xb4, 0x03, 0x3c, 0xbc, 0x83, 0x3c, 0x84, 0x03, 0x3b, 0xcc, 0xf0, 0x14, 0x76, 0x60, 0x07, 0x7b, 0x68, 0x07, 0x37, 0x68, 0x87, 0x72, 0x68, 0x07, 0x37,
+        0x80, 0x87, 0x70, 0x90, 0x87, 0x70, 0x60, 0x07, 0x76, 0x28, 0x07, 0x76, 0xf8, 0x05, 0x76, 0x78, 0x87, 0x77, 0x80, 0x87, 0x5f, 0x08, 0x87, 0x71, 0x18, 0x87, 0x72, 0x98, 0x87, 0x79, 0x98, 0x81,
+        0x2c, 0xee, 0xf0, 0x0e, 0xee, 0xe0, 0x0e, 0xf5, 0xc0, 0x0e, 0xec, 0x30, 0x03, 0x62, 0xc8, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c, 0xcc, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c, 0xdc, 0x61, 0x1c, 0xca, 0x21, 0x1c,
+        0xc4, 0x81, 0x1d, 0xca, 0x61, 0x06, 0xd6, 0x90, 0x43, 0x39, 0xc8, 0x43, 0x39, 0x98, 0x43, 0x39, 0xc8, 0x43, 0x39, 0xb8, 0xc3, 0x38, 0x94, 0x43, 0x38, 0x88, 0x03, 0x3b, 0x94, 0xc3, 0x2f, 0xbc,
+        0x83, 0x3c, 0xfc, 0x82, 0x3b, 0xd4, 0x03, 0x3b, 0xb0, 0xc3, 0x8c, 0xc8, 0x21, 0x07, 0x7c, 0x70, 0x03, 0x72, 0x10, 0x87, 0x73, 0x70, 0x03, 0x7b, 0x08, 0x07, 0x79, 0x60, 0x87, 0x70, 0xc8, 0x87,
+        0x77, 0xa8, 0x07, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x71, 0x20, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x26, 0xb0, 0x0d, 0x97, 0xef, 0x3c, 0xbe, 0x10, 0x50, 0x45, 0x41, 0x44, 0xa5, 0x03, 0x0c, 0x25,
+        0x61, 0x00, 0x02, 0xe6, 0x17, 0xb7, 0x6d, 0x03, 0xd2, 0x70, 0xf9, 0xce, 0xe3, 0x0b, 0x11, 0x01, 0x4c, 0x44, 0x08, 0x34, 0xc3, 0x42, 0x58, 0xc0, 0x37, 0x5c, 0xbe, 0xf3, 0xf8, 0x56, 0x84, 0x4c,
+        0x04, 0x0b, 0x30, 0xcf, 0x42, 0x44, 0x1f, 0x41, 0x0c, 0x01, 0x20, 0x28, 0x25, 0x51, 0x11, 0x8b, 0x01, 0x10, 0x0c, 0x80, 0x34, 0x00, 0x00, 0x00, 0x61, 0x20, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00,
+        0x13, 0x04, 0x41, 0x2c, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x34, 0x4a, 0xae, 0xec, 0x0a, 0x5c, 0x80, 0x48, 0x09, 0x8c, 0x00, 0x94, 0x41, 0x11, 0xd0, 0x99, 0x01, 0x00, 0x00, 0x00,
+        0x23, 0x06, 0x09, 0x00, 0x82, 0x60, 0xe0, 0x60, 0x48, 0x31, 0x4d, 0xcd, 0x88, 0x41, 0x02, 0x80, 0x20, 0x18, 0x38, 0x59, 0x52, 0x50, 0x94, 0x33, 0x62, 0x90, 0x00, 0x20, 0x08, 0x06, 0x8e, 0xa6,
+        0x14, 0x55, 0xf5, 0x8c, 0x18, 0x24, 0x00, 0x08, 0x82, 0x81, 0xb3, 0x2d, 0x85, 0x65, 0x41, 0x23, 0x06, 0x07, 0x00, 0x82, 0x60, 0xb0, 0x74, 0x4b, 0x70, 0x8d, 0x26, 0x04, 0xc2, 0x68, 0x82, 0x00,
+        0x8c, 0x26, 0x0c, 0xc1, 0x88, 0x41, 0x03, 0x80, 0x20, 0x18, 0x20, 0x62, 0xe0, 0x20, 0x87, 0x21, 0x04, 0x49, 0x32, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const D3D12_SHADER_BYTECODE cs_code_dxil = SHADER_BYTECODE(cs_code);
+
+#define TEX_WIDTH 4096u
+#define TEX_HEIGHT 2048u
+#define MIP_REGION_WIDTH 128u
+#define MIP_REGION_HEIGHT 64u
+#define FEEDBACK_WIDTH (TEX_WIDTH / MIP_REGION_WIDTH)
+#define FEEDBACK_HEIGHT (TEX_HEIGHT / MIP_REGION_HEIGHT)
+#define TEX_MIP_LEVELS 6
+#define TEX_MIP_LEVELS_VIEW TEX_MIP_LEVELS
+
+    static const int coords[][3] = {
+        { 0, 0, 0 },
+        { TEX_WIDTH - MIP_REGION_WIDTH, 0, 0 },
+        { TEX_WIDTH - MIP_REGION_WIDTH, TEX_HEIGHT - MIP_REGION_HEIGHT, 0 },
+        { TEX_WIDTH + MIP_REGION_WIDTH, TEX_HEIGHT + MIP_REGION_HEIGHT, 0 },
+        { 0, TEX_HEIGHT - MIP_REGION_HEIGHT, 0 },
+
+        { MIP_REGION_WIDTH * 20 + 3, MIP_REGION_HEIGHT * 17 + 1, 1 },
+        { MIP_REGION_WIDTH * 21 + 5, MIP_REGION_HEIGHT * 19 + 4, 2 },
+        { MIP_REGION_WIDTH * 22 + 7, MIP_REGION_HEIGHT * 25 + 2, 3 },
+
+        { MIP_REGION_WIDTH * 2, MIP_REGION_HEIGHT * 3, TEX_MIP_LEVELS_VIEW }
+    };
+
+    uint8_t expected_output[TEX_MIP_LEVELS][FEEDBACK_HEIGHT][FEEDBACK_WIDTH];
+    memset(expected_output, 0, sizeof(expected_output));
+
+    {
+        int tile_x, tile_y;
+
+        for (i = 0; i < ARRAY_SIZE(coords); i++)
+        {
+            int effective_lod = min(coords[i][2], TEX_MIP_LEVELS_VIEW - 1);
+
+            tile_x = (coords[i][0] % TEX_WIDTH) / MIP_REGION_WIDTH;
+            tile_y = (coords[i][1] % TEX_HEIGHT) / MIP_REGION_HEIGHT;
+            tile_x >>= effective_lod;
+            tile_y >>= effective_lod;
+
+            expected_output[effective_lod][tile_y][tile_x] = 0xff;
+        }
+    }
+
+    memset(&context_desc, 0, sizeof(context_desc));
+    context_desc.no_pipeline = true;
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS7, &features7, sizeof(features7))) ||
+        features7.SamplerFeedbackTier < D3D12_SAMPLER_FEEDBACK_TIER_0_9)
+    {
+        skip("Sampler feedback not supported.\n");
+        destroy_test_context(&context);
+        return;
+    }
+
+    hr = ID3D12Device_QueryInterface(context.device, &IID_ID3D12Device8, (void **)&device8);
+    ok(SUCCEEDED(hr), "Failed to query Device8, hr #%x.\n", hr);
+    hr = ID3D12GraphicsCommandList_QueryInterface(context.list, &IID_ID3D12GraphicsCommandList1, (void **)&list1);
+    ok(SUCCEEDED(hr), "Failed to query GraphicsCommandList1, hr #%x.\n", hr);
+
+    memset(&rs_desc, 0, sizeof(rs_desc));
+    memset(desc_range, 0, sizeof(desc_range));
+    memset(rs_param, 0, sizeof(rs_param));
+    memset(&static_sampler, 0, sizeof(static_sampler));
+    rs_desc.NumParameters = ARRAY_SIZE(rs_param);
+    rs_desc.pParameters = rs_param;
+    rs_desc.NumStaticSamplers = 1;
+    rs_desc.pStaticSamplers = &static_sampler;
+
+    static_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    static_sampler.MaxLOD = 1000.0f;
+
+    rs_param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_param[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rs_param[0].DescriptorTable.NumDescriptorRanges = ARRAY_SIZE(desc_range);
+    rs_param[0].DescriptorTable.pDescriptorRanges = desc_range;
+    desc_range[0].NumDescriptors = 1;
+    desc_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    desc_range[1].NumDescriptors = 1;
+    desc_range[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    desc_range[1].OffsetInDescriptorsFromTableStart = 1;
+    rs_param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rs_param[1].Constants.Num32BitValues = 3;
+
+    create_root_signature(context.device, &rs_desc, &context.root_signature);
+    context.pipeline_state = create_compute_pipeline_state(context.device, context.root_signature, cs_code_dxil);
+    ok(!!context.pipeline_state, "Failed to create PSO.\n");
+
+    desc_heap = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2);
+    desc_heap_cpu = create_cpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+
+    resource = create_default_texture2d(context.device, TEX_WIDTH, TEX_HEIGHT, 1, TEX_MIP_LEVELS, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    resolve = create_default_texture2d(context.device, FEEDBACK_WIDTH, FEEDBACK_HEIGHT, 1, TEX_MIP_LEVELS, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+
+    memset(&desc, 0, sizeof(desc));
+    memset(&heap_props, 0, sizeof(heap_props));
+
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Width = TEX_WIDTH;
+    desc.Height = TEX_HEIGHT;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = TEX_MIP_LEVELS;
+    desc.SamplerFeedbackMipRegion.Width = MIP_REGION_WIDTH;
+    desc.SamplerFeedbackMipRegion.Height = MIP_REGION_HEIGHT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heap));
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heap_cpu));
+
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+        memset(&srv_desc, 0, sizeof(srv_desc));
+        srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = TEX_MIP_LEVELS_VIEW; /* Verify that the SRV itself clamps the feedback that is written. */
+        ID3D12Device_CreateShaderResourceView(context.device, resource, &srv_desc, get_cpu_descriptor_handle(&context, desc_heap, 1));
+    }
+
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &desc_heap);
+
+    {
+        UINT zeroes[4] = { 0x80 }; /* Clear value is ignored. The actual clear value is opaque, but after a resolve, it should be 0. */
+        ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(context.list,
+            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(desc_heap),
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heap_cpu),
+            feedback, zeroes, 0, NULL);
+        uav_barrier(context.list, feedback);
+    }
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(desc_heap));
+
+    for (i = 0; i < ARRAY_SIZE(coords); i++)
+    {
+        float normalized_coords[3] = { ((float)coords[i][0] + 0.5f) / TEX_WIDTH, ((float)coords[i][1] + 0.5f) / TEX_HEIGHT, (float)coords[i][2] };
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, 3, normalized_coords, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+    }
+
+    transition_resource_state(context.list, feedback, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve, UINT_MAX, 0, 0, feedback, UINT_MAX, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+    transition_resource_state(context.list, resolve, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    for (i = 0; i < TEX_MIP_LEVELS; i++)
+    {
+        get_texture_readback_with_command_list(resolve, i, &rb, context.queue, context.list);
+
+        for (y = 0; y < (FEEDBACK_HEIGHT >> i); y++)
+        {
+            for (x = 0; x < (FEEDBACK_WIDTH >> i); x++)
+            {
+                unsigned int value;
+                value = get_readback_uint8(&rb, x, y);
+
+                /* NV seems to drop writes on the floor. Seems related to WRAP mode. */
+                bug_if(is_nvidia_windows_device(context.device) && value == 0 && expected_output[i][y][x] == 0xff)
+                    ok(value == expected_output[i][y][x], "Mip %u, Coord %u, %u: expected %u, got %u.\n", i, x, y, expected_output[i][y][x], value);
+            }
+        }
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+    }
 
     ID3D12GraphicsCommandList1_Release(list1);
     ID3D12Resource_Release(resource);
@@ -431,3 +981,626 @@ void test_sampler_feedback_min_mip_level(void)
 #undef TEX_MIP_LEVELS_VIEW
 }
 
+void test_sampler_feedback_grad(void)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 features7;
+    D3D12_DESCRIPTOR_RANGE desc_range_sampler;
+    struct test_context_desc context_desc;
+    D3D12_DESCRIPTOR_RANGE desc_range[2];
+    ID3D12DescriptorHeap *desc_heap_cpu;
+    ID3D12DescriptorHeap *desc_heaps[2];
+    D3D12_ROOT_SIGNATURE_DESC rs_desc;
+    ID3D12GraphicsCommandList1 *list1;
+    D3D12_ROOT_PARAMETER rs_param[3];
+    D3D12_HEAP_PROPERTIES heap_props;
+    ID3D12Resource *feedback_used;
+    ID3D12Resource *feedback_min;
+    ID3D12Resource *resolve_used;
+    ID3D12Resource *resolve_min;
+    struct test_context context;
+    struct resource_readback rb;
+    D3D12_RESOURCE_DESC1 desc;
+    ID3D12Resource *resource;
+    ID3D12Device8 *device8;
+    unsigned int x, y, i;
+    HRESULT hr;
+
+    static const BYTE cs_code[] =
+    {
+#if 0
+    Texture2D<float> T : register(t0);
+    SamplerState S : register(s0);
+    FeedbackTexture2D<SAMPLER_FEEDBACK_MIP_REGION_USED> FB : register(u0);
+    FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> FB2 : register(u1);
+
+    cbuffer Cbuf : register(b0) { float2 uv, dx, dy; };
+
+    [numthreads(1, 1, 1)]
+    void main()
+    {
+            FB.WriteSamplerFeedbackGrad(T, S, uv, dx, dy);
+            FB2.WriteSamplerFeedbackGrad(T, S, uv, dx, dy);
+    }
+#endif
+        0x44, 0x58, 0x42, 0x43, 0x3a, 0x59, 0x5d, 0xdd, 0xd4, 0x5e, 0xef, 0x36, 0x23, 0x6e, 0x31, 0x37, 0xce, 0x3c, 0x25, 0x01, 0x01, 0x00, 0x00, 0x00, 0xe4, 0x07, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+        0x38, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x30, 0x01, 0x00, 0x00, 0x4c, 0x01, 0x00, 0x00, 0x53, 0x46, 0x49, 0x30, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49, 0x53, 0x47, 0x31, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x4f, 0x53, 0x47, 0x31, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x50, 0x53, 0x56, 0x30, 0xc0, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x41, 0x53, 0x48, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0xb6, 0x84, 0x01,
+        0x10, 0x55, 0xfb, 0x8d, 0x04, 0xd8, 0xec, 0x4c, 0x82, 0xd0, 0x36, 0x15, 0x44, 0x58, 0x49, 0x4c, 0x90, 0x06, 0x00, 0x00, 0x65, 0x00, 0x05, 0x00, 0xa4, 0x01, 0x00, 0x00, 0x44, 0x58, 0x49, 0x4c,
+        0x05, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x78, 0x06, 0x00, 0x00, 0x42, 0x43, 0xc0, 0xde, 0x21, 0x0c, 0x00, 0x00, 0x9b, 0x01, 0x00, 0x00, 0x0b, 0x82, 0x20, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x13, 0x00, 0x00, 0x00, 0x07, 0x81, 0x23, 0x91, 0x41, 0xc8, 0x04, 0x49, 0x06, 0x10, 0x32, 0x39, 0x92, 0x01, 0x84, 0x0c, 0x25, 0x05, 0x08, 0x19, 0x1e, 0x04, 0x8b, 0x62, 0x80, 0x14, 0x45, 0x02,
+        0x42, 0x92, 0x0b, 0x42, 0xa4, 0x10, 0x32, 0x14, 0x38, 0x08, 0x18, 0x4b, 0x0a, 0x32, 0x52, 0x88, 0x48, 0x90, 0x14, 0x20, 0x43, 0x46, 0x88, 0xa5, 0x00, 0x19, 0x32, 0x42, 0xe4, 0x48, 0x0e, 0x90,
+        0x91, 0x22, 0xc4, 0x50, 0x41, 0x51, 0x81, 0x8c, 0xe1, 0x83, 0xe5, 0x8a, 0x04, 0x29, 0x46, 0x06, 0x51, 0x18, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x1b, 0x88, 0xe0, 0xff, 0xff, 0xff, 0xff, 0x07,
+        0x40, 0xda, 0x60, 0x08, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x00, 0x12, 0x50, 0x01, 0x00, 0x00, 0x00, 0x49, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x13, 0x82, 0x60, 0x42, 0x20, 0x00, 0x00, 0x00,
+        0x89, 0x20, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00, 0x32, 0x22, 0x48, 0x09, 0x20, 0x64, 0x85, 0x04, 0x93, 0x22, 0xa4, 0x84, 0x04, 0x93, 0x22, 0xe3, 0x84, 0xa1, 0x90, 0x14, 0x12, 0x4c, 0x8a, 0x8c,
+        0x0b, 0x84, 0xa4, 0x4c, 0x10, 0x74, 0x23, 0x00, 0x25, 0x00, 0x14, 0xe6, 0x08, 0xc0, 0x60, 0x8e, 0x00, 0x21, 0x72, 0xcf, 0x70, 0xf9, 0x13, 0xf6, 0x10, 0x92, 0x1f, 0x02, 0xcd, 0xb0, 0x10, 0x28,
+        0x28, 0x33, 0x00, 0x05, 0x02, 0xc3, 0x18, 0x73, 0xce, 0x39, 0xe7, 0x9c, 0x73, 0xce, 0x21, 0x74, 0xd4, 0x70, 0xf9, 0x13, 0xf6, 0x10, 0x92, 0xcf, 0x6d, 0x54, 0xb1, 0x12, 0x93, 0x5f, 0xdc, 0x36,
+        0x22, 0xce, 0x39, 0xa7, 0x10, 0x6a, 0x98, 0x41, 0x6b, 0x8e, 0x20, 0x28, 0x86, 0x19, 0x64, 0x8c, 0x46, 0x6e, 0x20, 0x60, 0xa6, 0x30, 0x18, 0x07, 0x76, 0x08, 0x87, 0x79, 0x98, 0x07, 0x37, 0xa0,
+        0x85, 0x72, 0xc0, 0x07, 0x7a, 0xa8, 0x07, 0x79, 0x28, 0x07, 0x39, 0x20, 0x05, 0x3e, 0x30, 0x07, 0x76, 0x78, 0x87, 0x70, 0xa0, 0x07, 0x3f, 0xd0, 0x03, 0x3d, 0x68, 0x87, 0x74, 0x80, 0x87, 0x79,
+        0xf8, 0x05, 0x7a, 0xc8, 0x07, 0x78, 0x28, 0x07, 0x14, 0x8c, 0x99, 0xac, 0x71, 0x60, 0x87, 0x70, 0x98, 0x87, 0x79, 0x70, 0x03, 0x5a, 0x28, 0x07, 0x7c, 0xa0, 0x87, 0x7a, 0x90, 0x87, 0x72, 0x90,
+        0x03, 0x52, 0xe0, 0x03, 0x73, 0x60, 0x87, 0x77, 0x08, 0x07, 0x7a, 0xf0, 0x03, 0x24, 0x9c, 0x48, 0x72, 0x26, 0x6d, 0x1c, 0xd8, 0x21, 0x1c, 0xe6, 0x61, 0x1e, 0xdc, 0xc0, 0x14, 0xca, 0xa1, 0x1c,
+        0xc8, 0x41, 0x1c, 0xc2, 0x61, 0x1c, 0xd6, 0x81, 0x16, 0xca, 0x01, 0x1f, 0xe8, 0xa1, 0x1e, 0xe4, 0xa1, 0x1c, 0xe4, 0x80, 0x14, 0xf8, 0x20, 0x0e, 0xfc, 0x00, 0x05, 0x83, 0xe8, 0x4c, 0xda, 0x38,
+        0xb0, 0x43, 0x38, 0xcc, 0xc3, 0x3c, 0xb8, 0x81, 0x29, 0x94, 0x43, 0x39, 0x90, 0x83, 0x38, 0x84, 0xc3, 0x38, 0xac, 0x03, 0x2d, 0x94, 0x03, 0x3e, 0xd0, 0x43, 0x3d, 0xc8, 0x43, 0x39, 0xc8, 0x01,
+        0x29, 0xf0, 0x01, 0x1c, 0xf8, 0x01, 0x0a, 0x06, 0xd9, 0x61, 0x04, 0xe1, 0x38, 0x82, 0x0b, 0xa8, 0x02, 0x0d, 0x18, 0x63, 0xca, 0x37, 0x49, 0x53, 0x44, 0x09, 0x93, 0xcf, 0x02, 0xcc, 0xb3, 0x10,
+        0x11, 0x3b, 0x01, 0x13, 0x81, 0x82, 0x41, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x13, 0x14, 0x72, 0xc0, 0x87, 0x74, 0x60, 0x87, 0x36, 0x68, 0x87, 0x79, 0x68, 0x03, 0x72, 0xc0, 0x87, 0x0d, 0xaf, 0x50,
+        0x0e, 0x6d, 0xd0, 0x0e, 0x7a, 0x50, 0x0e, 0x6d, 0x00, 0x0f, 0x7a, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x71, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x78,
+        0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x71, 0x60, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xd0, 0x06, 0xe9, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x90, 0x0e, 0x76, 0x40, 0x07,
+        0x7a, 0x60, 0x07, 0x74, 0xd0, 0x06, 0xe6, 0x10, 0x07, 0x76, 0xa0, 0x07, 0x73, 0x20, 0x07, 0x6d, 0x60, 0x0e, 0x73, 0x20, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xd0, 0x06, 0xe6, 0x60, 0x07, 0x74, 0xa0,
+        0x07, 0x76, 0x40, 0x07, 0x6d, 0xe0, 0x0e, 0x78, 0xa0, 0x07, 0x71, 0x60, 0x07, 0x7a, 0x30, 0x07, 0x72, 0xa0, 0x07, 0x76, 0x40, 0x07, 0x43, 0x9e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x86, 0x3c, 0x08, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x79, 0x16, 0x20, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0xf2, 0x38,
+        0x40, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x05, 0x02, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x32, 0x1e, 0x98, 0x14, 0x19, 0x11, 0x4c, 0x90, 0x8c, 0x09, 0x26, 0x47,
+        0xc6, 0x04, 0x43, 0x1a, 0x25, 0x50, 0x0a, 0xe5, 0x50, 0x0c, 0x23, 0x00, 0x45, 0x50, 0x12, 0x25, 0x52, 0x30, 0x85, 0x40, 0x6d, 0x04, 0x80, 0xe6, 0x0c, 0x00, 0xd5, 0x19, 0x00, 0xba, 0x33, 0x00,
+        0xa4, 0x67, 0x00, 0x88, 0xcf, 0x00, 0x00, 0x00, 0x79, 0x18, 0x00, 0x00, 0x4c, 0x00, 0x00, 0x00, 0x1a, 0x03, 0x4c, 0x90, 0x46, 0x02, 0x13, 0x44, 0x8f, 0x0c, 0x6f, 0xec, 0xed, 0x4d, 0x0c, 0x24,
+        0xc6, 0xe5, 0xc6, 0x45, 0x46, 0x26, 0x46, 0xc6, 0x85, 0x06, 0x06, 0x04, 0xa5, 0x0c, 0x86, 0x66, 0xc6, 0x8c, 0x26, 0x2c, 0x46, 0x26, 0x65, 0x43, 0x10, 0x4c, 0x10, 0x06, 0x62, 0x82, 0x30, 0x14,
+        0x1b, 0x84, 0x81, 0x98, 0x20, 0x0c, 0xc6, 0x06, 0x61, 0x30, 0x28, 0x8c, 0xcd, 0x4d, 0x10, 0x86, 0x63, 0xc3, 0x80, 0x24, 0xc4, 0x04, 0x61, 0x40, 0x26, 0x08, 0xd3, 0x43, 0x60, 0x82, 0x30, 0x24,
+        0x13, 0x84, 0x41, 0xd9, 0x20, 0x2c, 0xcf, 0x86, 0x64, 0x61, 0x9a, 0x65, 0x19, 0x9c, 0x05, 0xda, 0x10, 0x44, 0x13, 0x84, 0x0a, 0x9a, 0x20, 0x0c, 0xcb, 0x04, 0xa1, 0x71, 0x36, 0x08, 0xce, 0xb0,
+        0x61, 0x59, 0xa6, 0x66, 0x59, 0x06, 0xaa, 0xaa, 0x2a, 0x6b, 0x82, 0x70, 0x45, 0x1b, 0x04, 0x67, 0xd9, 0xb0, 0x0c, 0x58, 0xb3, 0x0c, 0x03, 0x55, 0x55, 0x55, 0xb6, 0x41, 0xb8, 0xb4, 0x09, 0x82,
+        0x26, 0x4d, 0x10, 0x06, 0x66, 0x03, 0xb2, 0x70, 0xcd, 0xb2, 0x0c, 0x1d, 0xb0, 0x21, 0xf0, 0x26, 0x08, 0xdc, 0xb4, 0x01, 0x59, 0xc0, 0xa0, 0x59, 0x96, 0x61, 0x01, 0x36, 0x04, 0x61, 0xb0, 0x81,
+        0x90, 0xb6, 0x4f, 0x0c, 0x26, 0x08, 0x02, 0x40, 0xa2, 0x2d, 0x2c, 0xcd, 0x6d, 0x82, 0x30, 0x34, 0x1b, 0x86, 0x61, 0x18, 0x36, 0x08, 0x66, 0x70, 0x06, 0x1b, 0x0a, 0x32, 0x28, 0x03, 0x60, 0x0c,
+        0xd0, 0xa0, 0x0a, 0x1b, 0x9b, 0x5d, 0x9b, 0x4b, 0x1a, 0x59, 0x99, 0x1b, 0xdd, 0x94, 0x20, 0xa8, 0x42, 0x86, 0xe7, 0x62, 0x57, 0x26, 0x37, 0x97, 0xf6, 0xe6, 0x36, 0x25, 0x20, 0x9a, 0x90, 0xe1,
+        0xb9, 0xd8, 0x85, 0xb1, 0xd9, 0x95, 0xc9, 0x4d, 0x09, 0x8c, 0x3a, 0x64, 0x78, 0x2e, 0x73, 0x68, 0x61, 0x64, 0x65, 0x72, 0x4d, 0x6f, 0x64, 0x65, 0x6c, 0x53, 0x82, 0xa4, 0x0c, 0x19, 0x9e, 0x8b,
+        0x5c, 0xd9, 0xdc, 0x5b, 0x9d, 0xdc, 0x58, 0xd9, 0xdc, 0x94, 0x40, 0x0c, 0xea, 0x90, 0xe1, 0xb9, 0x94, 0xb9, 0xd1, 0xc9, 0xe5, 0x41, 0xbd, 0xa5, 0xb9, 0xd1, 0xcd, 0x4d, 0x09, 0xd0, 0x00, 0x00,
+        0x79, 0x18, 0x00, 0x00, 0x49, 0x00, 0x00, 0x00, 0x33, 0x08, 0x80, 0x1c, 0xc4, 0xe1, 0x1c, 0x66, 0x14, 0x01, 0x3d, 0x88, 0x43, 0x38, 0x84, 0xc3, 0x8c, 0x42, 0x80, 0x07, 0x79, 0x78, 0x07, 0x73,
+        0x98, 0x71, 0x0c, 0xe6, 0x00, 0x0f, 0xed, 0x10, 0x0e, 0xf4, 0x80, 0x0e, 0x33, 0x0c, 0x42, 0x1e, 0xc2, 0xc1, 0x1d, 0xce, 0xa1, 0x1c, 0x66, 0x30, 0x05, 0x3d, 0x88, 0x43, 0x38, 0x84, 0x83, 0x1b,
+        0xcc, 0x03, 0x3d, 0xc8, 0x43, 0x3d, 0x8c, 0x03, 0x3d, 0xcc, 0x78, 0x8c, 0x74, 0x70, 0x07, 0x7b, 0x08, 0x07, 0x79, 0x48, 0x87, 0x70, 0x70, 0x07, 0x7a, 0x70, 0x03, 0x76, 0x78, 0x87, 0x70, 0x20,
+        0x87, 0x19, 0xcc, 0x11, 0x0e, 0xec, 0x90, 0x0e, 0xe1, 0x30, 0x0f, 0x6e, 0x30, 0x0f, 0xe3, 0xf0, 0x0e, 0xf0, 0x50, 0x0e, 0x33, 0x10, 0xc4, 0x1d, 0xde, 0x21, 0x1c, 0xd8, 0x21, 0x1d, 0xc2, 0x61,
+        0x1e, 0x66, 0x30, 0x89, 0x3b, 0xbc, 0x83, 0x3b, 0xd0, 0x43, 0x39, 0xb4, 0x03, 0x3c, 0xbc, 0x83, 0x3c, 0x84, 0x03, 0x3b, 0xcc, 0xf0, 0x14, 0x76, 0x60, 0x07, 0x7b, 0x68, 0x07, 0x37, 0x68, 0x87,
+        0x72, 0x68, 0x07, 0x37, 0x80, 0x87, 0x70, 0x90, 0x87, 0x70, 0x60, 0x07, 0x76, 0x28, 0x07, 0x76, 0xf8, 0x05, 0x76, 0x78, 0x87, 0x77, 0x80, 0x87, 0x5f, 0x08, 0x87, 0x71, 0x18, 0x87, 0x72, 0x98,
+        0x87, 0x79, 0x98, 0x81, 0x2c, 0xee, 0xf0, 0x0e, 0xee, 0xe0, 0x0e, 0xf5, 0xc0, 0x0e, 0xec, 0x30, 0x03, 0x62, 0xc8, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c, 0xcc, 0xa1, 0x1c, 0xe4, 0xa1, 0x1c, 0xdc, 0x61,
+        0x1c, 0xca, 0x21, 0x1c, 0xc4, 0x81, 0x1d, 0xca, 0x61, 0x06, 0xd6, 0x90, 0x43, 0x39, 0xc8, 0x43, 0x39, 0x98, 0x43, 0x39, 0xc8, 0x43, 0x39, 0xb8, 0xc3, 0x38, 0x94, 0x43, 0x38, 0x88, 0x03, 0x3b,
+        0x94, 0xc3, 0x2f, 0xbc, 0x83, 0x3c, 0xfc, 0x82, 0x3b, 0xd4, 0x03, 0x3b, 0xb0, 0xc3, 0x8c, 0xc8, 0x21, 0x07, 0x7c, 0x70, 0x03, 0x72, 0x10, 0x87, 0x73, 0x70, 0x03, 0x7b, 0x08, 0x07, 0x79, 0x60,
+        0x87, 0x70, 0xc8, 0x87, 0x77, 0xa8, 0x07, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x71, 0x20, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x26, 0xb0, 0x0d, 0x97, 0xef, 0x3c, 0xbe, 0x10, 0x50, 0x45, 0x41, 0x44,
+        0xa5, 0x03, 0x0c, 0x25, 0x61, 0x00, 0x02, 0xe6, 0x17, 0xb7, 0x6d, 0x03, 0xd2, 0x70, 0xf9, 0xce, 0xe3, 0x0b, 0x11, 0x01, 0x4c, 0x44, 0x08, 0x34, 0xc3, 0x42, 0x58, 0x80, 0x37, 0x5c, 0xbe, 0xf3,
+        0xf8, 0x56, 0x84, 0x4c, 0x04, 0x0b, 0x30, 0xcf, 0x42, 0x44, 0x1f, 0x41, 0x0c, 0x01, 0x20, 0x28, 0x60, 0x04, 0x0c, 0x06, 0x40, 0x30, 0x00, 0xd2, 0x00, 0x00, 0x00, 0x00, 0x61, 0x20, 0x00, 0x00,
+        0x37, 0x00, 0x00, 0x00, 0x13, 0x04, 0x41, 0x2c, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x34, 0x4a, 0xae, 0xec, 0x4a, 0x5c, 0x80, 0x48, 0x09, 0x8c, 0x00, 0x94, 0x41, 0x11, 0xd0, 0x99,
+        0x01, 0x00, 0x00, 0x00, 0x23, 0x06, 0x09, 0x00, 0x82, 0x60, 0xe0, 0x64, 0x48, 0x81, 0x61, 0xce, 0x88, 0x41, 0x02, 0x80, 0x20, 0x18, 0x38, 0x5a, 0x62, 0x54, 0xd5, 0x33, 0x62, 0x90, 0x00, 0x20,
+        0x08, 0x06, 0xce, 0xa6, 0x18, 0x96, 0x05, 0x8d, 0x18, 0x24, 0x00, 0x08, 0x82, 0x81, 0xc3, 0x2d, 0xc6, 0x75, 0x45, 0x23, 0x06, 0x09, 0x00, 0x82, 0x60, 0xe0, 0x74, 0x8c, 0x81, 0x61, 0xd2, 0x88,
+        0xc1, 0x01, 0x80, 0x20, 0x18, 0x2c, 0x1f, 0x13, 0x74, 0xa3, 0x09, 0x01, 0x30, 0x9a, 0x20, 0x04, 0x23, 0x06, 0x07, 0x00, 0x82, 0x60, 0xb0, 0x88, 0xc1, 0x43, 0x70, 0xa3, 0x09, 0x81, 0x30, 0x9a,
+        0x20, 0x0c, 0xa3, 0x09, 0x03, 0x30, 0x9a, 0x40, 0x04, 0x23, 0x06, 0x13, 0x00, 0x82, 0x60, 0x80, 0xa0, 0xc1, 0xc4, 0x2c, 0x8a, 0x10, 0x38, 0x0e, 0x31, 0x38, 0x87, 0xe1, 0x38, 0x23, 0x06, 0x07,
+        0x00, 0x82, 0x60, 0xb0, 0x9c, 0x01, 0x95, 0x94, 0xc1, 0x68, 0x42, 0x00, 0x8c, 0x26, 0x08, 0xc1, 0x88, 0xc1, 0x01, 0x80, 0x20, 0x18, 0x2c, 0x6a, 0x70, 0x31, 0x64, 0x30, 0x9a, 0x10, 0x08, 0xa3,
+        0x09, 0xc2, 0x30, 0x9a, 0x30, 0x00, 0xa3, 0x09, 0x44, 0x30, 0x62, 0x30, 0x01, 0x20, 0x08, 0x06, 0x08, 0x1c, 0x6c, 0xd5, 0x24, 0x09, 0x81, 0x65, 0x11, 0x83, 0x75, 0x18, 0x96, 0x85, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    static const D3D12_SHADER_BYTECODE cs_code_dxil = SHADER_BYTECODE(cs_code);
+
+#define TEX_WIDTH 16
+#define TEX_HEIGHT 16
+#define MIP_REGION_WIDTH 4
+#define MIP_REGION_HEIGHT 4
+#define FEEDBACK_WIDTH (TEX_WIDTH / MIP_REGION_WIDTH)
+#define FEEDBACK_HEIGHT (TEX_HEIGHT / MIP_REGION_HEIGHT)
+#define TEX_MIP_LEVELS 2
+
+    /* Level 0 has 4x4 regions.
+     * Level 1 has 2x2 regions. Minimum viable size to test overlapping tile access. */
+
+    /* These reference results are based on AMD output. NV outputs are borderline non-sensical for purposes of testing implementation. */
+    static const struct test
+    {
+        /* If sub-texel offset is 0, we intend to sample exactly at texel center. */
+#define MAKE_TEXEL(x, y, sub_x, sub_y) { ((float)(x) + 0.5f + (float)(sub_x) / 256.0f) / TEX_WIDTH, ((float)(y) + 0.5f + (float)(sub_y) / 256.0f) / TEX_HEIGHT }
+#define MAKE_MASK0(row0, row1, row2, row3) (((row0) << 0) | ((row1) << 4) | ((row2) << 8) | ((row3) << 12))
+#define MAKE_MASK1(row0, row1) (((row0) << 0) | ((row1) << 2))
+#define MAKE_ROW0(a, b, c, d) (((a) << 0) | ((b) << 1) | ((c) << 2) | ((d) << 3))
+#define MAKE_ROW1(a, b) (((a) << 0) | ((b) << 1))
+#define E 0xff
+#define ER {E, E, E, E}
+
+        float texel[2];
+        float dx[2];
+        float dy[2];
+
+        uint32_t mask0; /* Bitmask of accessed regions in level 0. */
+        uint32_t mask1; /* And level 1 */
+        uint8_t min_level[FEEDBACK_HEIGHT][FEEDBACK_WIDTH];
+
+        D3D12_TEXTURE_ADDRESS_MODE wrap_u, wrap_v;
+        D3D12_FILTER filter;
+        UINT max_aniso;
+        float mip_bias;
+        float min_lod;
+        float max_lod;
+    } tests[] = {
+        /* Very basic point sampling test just to sanity check. */
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, { E, 0, E, E }, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_POINT,
+        },
+
+        /* Proves that sampler filtering mode is important and accounted for. */
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(MAKE_ROW0(1, 1, 0, 0), MAKE_ROW0(1, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {{0, 0, E, E}, {0, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            0, 0.0f,
+        },
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT }, /* Compute exactly LOD 0 */
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, { E, 0, E, E }, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+            0, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 1.1f / TEX_WIDTH, 0 }, { 0, 1.1f / TEX_HEIGHT }, /* Compute LOD slightly above 0 to trigger MIN filter. */
+            MAKE_MASK0(MAKE_ROW0(1, 1, 0, 0), MAKE_ROW0(1, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {{0, 0, E, E}, {0, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+            0, 0.0f, 0.0f, 1.0f,
+        },
+        /* Check if mip-bias is accounted for. */
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 1.1f / TEX_WIDTH, 0 }, { 0, 1.1f / TEX_HEIGHT },
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, { E, 0, E, E }, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+            0, -0.5f, 0.0f, 1.0f,
+        },
+        /* Test if mip clamp is accounted for (minLOD) */
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 0 }, { 0 },
+            MAKE_MASK0(MAKE_ROW0(1, 1, 0, 0), MAKE_ROW0(1, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {{0, 0, E, E}, {0, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+            0, 0.0f, 0.1f, 1.0f,
+        },
+        /* Test if mip clamp is accounted for (maxLOD) */
+        {
+            MAKE_TEXEL(4, 4, 0, 0), { 1.1f / TEX_WIDTH, 0 }, { 0, 1.1f / TEX_HEIGHT }, /* Compute LOD slightly above 0 to trigger MIN filter. */
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, { E, 0, E, E }, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+            0, 0.0f, 0.0f, 0.0f,
+        },
+        /* Test POINT mip filtering. floor(lod + 0.5) behavior. */
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, 0),
+            {ER, ER, { E, E, 0, E }, ER },
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_POINT,
+            0, 0.49f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, 0, 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 0, E}, ER}, /* ?!?!?! It's only accessing LOD 1, but it's marking LOD 0 as minimum ;_; */
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_POINT,
+            0, 0.5f, 0.0f, 1.0f,
+        },
+
+        /* Test LINEAR mip filtering. */
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, 0),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, 0),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 0.25f / 256.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, 0),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 0.5f / 256.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 1.0f / 256.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 255.0f / 256.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 255.5f / 256.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, MAKE_ROW0(0, 0, 1, 0), 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 255.9f / 256.0f /* level is truncated before fixed point snap? */, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(8, 8, 0, 0), { 1.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, 0, 0, 0),
+            MAKE_MASK1(0, MAKE_ROW1(0, 1)),
+            {ER, ER, {E, E, 1, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+            0, 1.0f /* mip filter is fixed point */, 0.0f, 1.0f,
+        },
+        /* Try to sample in the center of a mip region (texel 5.5). Guess what happens next!
+         * Observed behavior is that when very close to the center of a mip region, no neighbors are affected.
+         * Straying just a little bit from the center will touch the closest neighbor.
+         * Theory: sampling coordinate is converted to a fixed-point texel value in feedback space.
+         * A [coord - e, coord + e] box is spanned out to determine writes, where e is likely 0.5 - epsilon. */
+        {
+            MAKE_TEXEL(5, 5, 125, 125), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(MAKE_ROW0(1, 1, 0, 0), MAKE_ROW0(1, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {{0, 0, E, E}, {0, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            0, 0.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 126, 126), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {E, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            0, 0.0f,
+        },
+        {
+            MAKE_TEXEL(6, 6, -126, -126), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 0, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {E, 0, E, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            0, 0.0f,
+        },
+        {
+            MAKE_TEXEL(6, 6, -125, -125), { 0, 0 }, { 0, 0 },
+            MAKE_MASK0(0, MAKE_ROW0(0, 1, 1, 0), MAKE_ROW0(0, 1, 1, 0), 0),
+            MAKE_MASK1(0, 0),
+            {ER, {E, 0, 0, E}, {E, 0, 0, E}, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            0, 0.0f,
+        },
+        /* Try anisotropic. Study if we can observe a rectangular footprint (we do). */
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 2.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            2, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 4.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT }, /* If we go beyond MaxAniso, we go to lower mips. */
+            MAKE_MASK0(0, 0, 0, 0),
+            MAKE_MASK1(MAKE_ROW1(1, 1), MAKE_ROW1(1, 1)),
+            {ER, {1, 1, 1, E}, ER, ER}, /* Interesting behavior! */
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            2, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 4.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            4, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 8.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            8, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(6, 5, 2, 128), { 8.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT },
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            8, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(6, 5, 3, 128), { 8.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT }, /* Observe threshold for where 8x aniso starts to light up the right-most tile. */
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 1), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, 0}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            8, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 8.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT }, /* Effective aniso rate does matter! (>_<) */
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 0), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, E}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            16, 0.0f, 0.0f, 1.0f,
+        },
+        {
+            MAKE_TEXEL(5, 5, 128, 128), { 16.0f / TEX_WIDTH, 0 }, { 0, 1.0f / TEX_HEIGHT }, /* Aniso rate does matter! (>_<) */
+            MAKE_MASK0(0, MAKE_ROW0(1, 1, 1, 1), 0, 0),
+            MAKE_MASK1(0, 0),
+            {ER, {0, 0, 0, 0}, ER, ER},
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_FILTER_ANISOTROPIC,
+            16, 0.0f, 0.0f, 1.0f,
+        },
+    };
+#undef MAKE_TEXEL
+#undef MAKE_MASK0
+#undef MAKE_MASK1
+#undef MAKE_ROW0
+#undef MAKE_ROW1
+#undef E
+#undef ER
+
+    memset(&context_desc, 0, sizeof(context_desc));
+    context_desc.no_pipeline = true;
+    context_desc.no_render_target = true;
+    context_desc.no_root_signature = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS7, &features7, sizeof(features7))) ||
+            features7.SamplerFeedbackTier < D3D12_SAMPLER_FEEDBACK_TIER_0_9)
+    {
+        skip("Sampler feedback not supported.\n");
+        destroy_test_context(&context);
+        return;
+    }
+
+    hr = ID3D12Device_QueryInterface(context.device, &IID_ID3D12Device8, (void **)&device8);
+    ok(SUCCEEDED(hr), "Failed to query Device8, hr #%x.\n", hr);
+    hr = ID3D12GraphicsCommandList_QueryInterface(context.list, &IID_ID3D12GraphicsCommandList1, (void **)&list1);
+    ok(SUCCEEDED(hr), "Failed to query GraphicsCommandList1, hr #%x.\n", hr);
+
+    memset(&rs_desc, 0, sizeof(rs_desc));
+    memset(desc_range, 0, sizeof(desc_range));
+    memset(&desc_range_sampler, 0, sizeof(desc_range_sampler));
+    memset(rs_param, 0, sizeof(rs_param));
+    rs_desc.NumParameters = ARRAY_SIZE(rs_param);
+    rs_desc.pParameters = rs_param;
+
+    rs_param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_param[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rs_param[0].DescriptorTable.NumDescriptorRanges = ARRAY_SIZE(desc_range);
+    rs_param[0].DescriptorTable.pDescriptorRanges = desc_range;
+    desc_range[0].NumDescriptors = 2;
+    desc_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    desc_range[1].NumDescriptors = 1;
+    desc_range[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    desc_range[1].OffsetInDescriptorsFromTableStart = 2;
+    rs_param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rs_param[1].Constants.Num32BitValues = 6;
+    rs_param[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_param[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rs_param[2].DescriptorTable.NumDescriptorRanges = 1;
+    rs_param[2].DescriptorTable.pDescriptorRanges = &desc_range_sampler;
+    desc_range_sampler.NumDescriptors = 1;
+    desc_range_sampler.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+
+    create_root_signature(context.device, &rs_desc, &context.root_signature);
+    context.pipeline_state = create_compute_pipeline_state(context.device, context.root_signature, cs_code_dxil);
+    ok(!!context.pipeline_state, "Failed to create PSO.\n");
+
+    desc_heaps[0] = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3);
+    desc_heaps[1] = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1);
+    desc_heap_cpu = create_cpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2);
+
+    resource = create_default_texture2d(context.device, TEX_WIDTH, TEX_HEIGHT, 1, TEX_MIP_LEVELS, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    resolve_used = create_default_texture2d(context.device, FEEDBACK_WIDTH, FEEDBACK_HEIGHT, 1, TEX_MIP_LEVELS, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    resolve_min = create_default_texture2d(context.device, FEEDBACK_WIDTH, FEEDBACK_HEIGHT, 1, 1, DXGI_FORMAT_R8_UINT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    memset(&desc, 0, sizeof(desc));
+    memset(&heap_props, 0, sizeof(heap_props));
+
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Width = TEX_WIDTH;
+    desc.Height = TEX_HEIGHT;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = TEX_MIP_LEVELS;
+    desc.SamplerFeedbackMipRegion.Width = MIP_REGION_WIDTH;
+    desc.SamplerFeedbackMipRegion.Height = MIP_REGION_HEIGHT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback_used);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+    desc.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
+    hr = ID3D12Device8_CreateCommittedResource2(device8, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, NULL, NULL, &IID_ID3D12Resource, (void **)&feedback_min);
+    ok(SUCCEEDED(hr), "Failed to create resource, hr #%x.\n", hr);
+
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback_used, get_cpu_descriptor_handle(&context, desc_heaps[0], 0));
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback_used, get_cpu_descriptor_handle(&context, desc_heap_cpu, 0));
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback_min, get_cpu_descriptor_handle(&context, desc_heaps[0], 1));
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(device8, resource, feedback_min, get_cpu_descriptor_handle(&context, desc_heap_cpu, 1));
+
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+        memset(&srv_desc, 0, sizeof(srv_desc));
+        srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = TEX_MIP_LEVELS; /* Verify that the SRV itself clamps the feedback that is written. */
+        ID3D12Device_CreateShaderResourceView(context.device, resource, &srv_desc, get_cpu_descriptor_handle(&context, desc_heaps[0], 2));
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        D3D12_SAMPLER_DESC sampler_desc;
+        uint32_t value_mask;
+
+        vkd3d_test_set_context("Test %u", i);
+
+        memset(&sampler_desc, 0, sizeof(sampler_desc));
+        sampler_desc.AddressU = tests[i].wrap_u;
+        sampler_desc.AddressV = tests[i].wrap_v;
+        sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler_desc.Filter = tests[i].filter;
+        sampler_desc.MinLOD = tests[i].min_lod;
+        sampler_desc.MaxLOD = tests[i].max_lod;
+        sampler_desc.MaxAnisotropy = tests[i].max_aniso;
+        sampler_desc.MipLODBias = tests[i].mip_bias;
+        ID3D12Device_CreateSampler(context.device, &sampler_desc, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(desc_heaps[1]));
+
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, ARRAY_SIZE(desc_heaps), desc_heaps);
+        transition_resource_state(context.list, feedback_used, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition_resource_state(context.list, feedback_min, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        {
+            UINT zeroes[4] = { 0x80 }; /* Clear value is ignored. The actual clear value is opaque, but after a resolve, it should be 0. */
+            ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(context.list,
+                get_gpu_descriptor_handle(&context, desc_heaps[0], 0),
+                get_cpu_descriptor_handle(&context, desc_heap_cpu, 0),
+                feedback_used, zeroes, 0, NULL);
+            ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(context.list,
+                get_gpu_descriptor_handle(&context, desc_heaps[0], 1),
+                get_cpu_descriptor_handle(&context, desc_heap_cpu, 1),
+                feedback_min, zeroes, 0, NULL);
+            uav_barrier(context.list, feedback_used);
+            uav_barrier(context.list, feedback_min);
+        }
+
+        ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+        ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(desc_heaps[0]));
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 2, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(desc_heaps[1]));
+
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, 6, &tests[i], 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+        transition_resource_state(context.list, feedback_used, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        transition_resource_state(context.list, resolve_used, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        transition_resource_state(context.list, feedback_min, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        transition_resource_state(context.list, resolve_min, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve_used, UINT_MAX, 0, 0, feedback_used, UINT_MAX, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+        ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, resolve_min, UINT_MAX, 0, 0, feedback_min, UINT_MAX, NULL, DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+        transition_resource_state(context.list, resolve_used, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition_resource_state(context.list, resolve_min, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        /* This test is extremely hard to pass, and is left as an exploratory test for now.
+         * Results vary wildly between all vendors here. */
+        value_mask = 0;
+        get_texture_readback_with_command_list(resolve_used, 0, &rb, context.queue, context.list);
+        for (y = 0; y < FEEDBACK_WIDTH; y++)
+        {
+            for (x = 0; x < FEEDBACK_WIDTH; x++)
+            {
+                uint8_t value = get_readback_uint8(&rb, x, y);
+                if (is_amd_windows_device(context.device))
+                    ok(value == 0 || value == 0xff, "Unexpected boolean %u.\n", value);
+                if (value)
+                    value_mask |= 1u << (y * FEEDBACK_WIDTH + x);
+            }
+        }
+
+        if (is_amd_windows_device(context.device))
+            ok(value_mask == tests[i].mask0, "Mip0: Expected #%x, got #%x.\n", tests[i].mask0, value_mask);
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+
+        value_mask = 0;
+        get_texture_readback_with_command_list(resolve_used, 1, &rb, context.queue, context.list);
+        for (y = 0; y < FEEDBACK_WIDTH / 2; y++)
+        {
+            for (x = 0; x < FEEDBACK_WIDTH / 2; x++)
+            {
+                uint8_t value = get_readback_uint8(&rb, x, y);
+                if (is_amd_windows_device(context.device))
+                    ok(value == 0 || value == 0xff, "Unexpected boolean %u.\n", value);
+                if (value)
+                    value_mask |= 1u << (y * FEEDBACK_WIDTH / 2 + x);
+            }
+        }
+        if (is_amd_windows_device(context.device))
+            ok(value_mask == tests[i].mask1, "Mip1: Expected #%x, got #%x.\n", tests[i].mask1, value_mask);
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+
+        get_texture_readback_with_command_list(resolve_min, 0, &rb, context.queue, context.list);
+        for (y = 0; y < FEEDBACK_WIDTH; y++)
+        {
+            for (x = 0; x < FEEDBACK_WIDTH; x++)
+            {
+                uint8_t value = get_readback_uint8(&rb, x, y);
+                if (is_amd_windows_device(context.device))
+                    ok(value == tests[i].min_level[y][x], "MinLevel %u, %u: expected %u, got %u.\n", x, y, tests[i].min_level[y][x], value);
+            }
+        }
+        if (!is_amd_windows_device(context.device))
+            skip("Skipping exploratory test on anything other than AMD Windows.\n");
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+    }
+    vkd3d_test_set_context(NULL);
+
+    ID3D12GraphicsCommandList1_Release(list1);
+    ID3D12Resource_Release(resource);
+    ID3D12Resource_Release(feedback_used);
+    ID3D12Resource_Release(resolve_used);
+    ID3D12Resource_Release(feedback_min);
+    ID3D12Resource_Release(resolve_min);
+    for (i = 0; i < ARRAY_SIZE(desc_heaps); i++)
+        ID3D12DescriptorHeap_Release(desc_heaps[i]);
+    ID3D12DescriptorHeap_Release(desc_heap_cpu);
+    ID3D12Device8_Release(device8);
+    destroy_test_context(&context);
+#undef TEX_WIDTH
+#undef TEX_HEIGHT
+#undef MIP_REGION_WIDTH
+#undef MIP_REGION_HEIGHT
+#undef FEEDBACK_WIDTH
+#undef FEEDBACK_HEIGHT
+#undef TEX_MIP_LEVELS
+}
