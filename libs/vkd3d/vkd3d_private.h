@@ -67,6 +67,7 @@
 typedef ID3D12Fence1 d3d12_fence_iface;
 
 struct d3d12_command_list;
+struct d3d12_command_allocator;
 struct d3d12_device;
 struct d3d12_resource;
 
@@ -207,8 +208,8 @@ struct vkd3d_waiting_fence
     d3d12_fence_iface *fence;
     VkSemaphore submission_timeline;
     uint64_t value;
-    LONG **submission_counters;
-    size_t num_submission_counts;
+    struct d3d12_command_allocator **command_allocators;
+    size_t num_command_allocators;
     bool signal;
 };
 
@@ -1413,6 +1414,7 @@ struct d3d12_descriptor_heap
 HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
         const D3D12_DESCRIPTOR_HEAP_DESC *desc, struct d3d12_descriptor_heap **descriptor_heap);
 void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap);
+bool d3d12_descriptor_heap_require_padding_descriptors(void);
 
 static inline struct d3d12_descriptor_heap *impl_from_ID3D12DescriptorHeap(ID3D12DescriptorHeap *iface)
 {
@@ -1801,6 +1803,22 @@ static inline const struct d3d12_bind_point_layout *d3d12_root_signature_get_lay
     }
 
     return NULL;
+}
+
+static inline bool d3d12_root_signature_is_compatible(
+        const struct d3d12_root_signature *a, const struct d3d12_root_signature *b)
+{
+    if (a && a->compatibility_hash == 0)
+        a = NULL;
+    if (b && b->compatibility_hash == 0)
+        b = NULL;
+
+    if (!a && !b)
+        return true;
+    else if ((!!a) != (!!b))
+        return false;
+    else
+        return a->compatibility_hash == b->compatibility_hash;
 }
 
 enum vkd3d_dynamic_state_flag
@@ -2333,6 +2351,7 @@ struct d3d12_command_allocator
 {
     ID3D12CommandAllocator ID3D12CommandAllocator_iface;
     LONG refcount;
+    LONG internal_refcount;
 
     D3D12_COMMAND_LIST_TYPE type;
     VkQueueFlags vk_queue_flags;
@@ -2359,8 +2378,6 @@ struct d3d12_command_allocator
     size_t query_pool_count;
 
     struct vkd3d_query_pool active_query_pools[VKD3D_VIRTUAL_QUERY_TYPE_COUNT];
-
-    LONG outstanding_submissions_count;
 
     struct d3d12_command_list *current_command_list;
     struct d3d12_device *device;
@@ -2774,8 +2791,10 @@ struct d3d12_command_list
 
     struct d3d12_pipeline_state *state;
     struct d3d12_state_object *rt_state;
+    const struct d3d12_state_object_variant *rt_state_variant;
 
     struct d3d12_command_allocator *allocator;
+    struct d3d12_command_allocator *submit_allocator;
     struct d3d12_device *device;
 
     VkBuffer so_buffers[D3D12_SO_BUFFER_SLOT_COUNT];
@@ -2799,8 +2818,6 @@ struct d3d12_command_list
     struct vkd3d_active_query *pending_queries;
     size_t pending_queries_size;
     size_t pending_queries_count;
-
-    LONG *outstanding_submissions_count;
 
     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
 
@@ -2992,9 +3009,9 @@ struct d3d12_command_queue_submission_signal
 struct d3d12_command_queue_submission_execute
 {
     VkCommandBufferSubmitInfo *cmd;
-    LONG **outstanding_submissions_counters;
+    struct d3d12_command_allocator **command_allocators;
     UINT cmd_count;
-    UINT outstanding_submissions_counter_count;
+    UINT num_command_allocators;
 
     struct vkd3d_initial_transition *transitions;
     size_t transition_count;
@@ -3111,6 +3128,9 @@ enum vkd3d_patch_command_token
     VKD3D_PATCH_COMMAND_TOKEN_COPY_FIRST_VERTEX = 15,
     VKD3D_PATCH_COMMAND_TOKEN_COPY_FIRST_INSTANCE = 16,
     VKD3D_PATCH_COMMAND_TOKEN_COPY_VERTEX_OFFSET = 17,
+    VKD3D_PATCH_COMMAND_TOKEN_COPY_MESH_TASKS_X = 18,
+    VKD3D_PATCH_COMMAND_TOKEN_COPY_MESH_TASKS_Y = 19,
+    VKD3D_PATCH_COMMAND_TOKEN_COPY_MESH_TASKS_Z = 20,
     VKD3D_PATCH_COMMAND_INT_MAX = 0x7fffffff
 };
 
@@ -3261,6 +3281,7 @@ enum vkd3d_breadcrumb_command_type
     VKD3D_BREADCRUMB_COMMAND_AUX64, /* Used to report arbitrary 64-bit words as arguments to other commands. */
     VKD3D_BREADCRUMB_COMMAND_VBO,
     VKD3D_BREADCRUMB_COMMAND_IBO,
+    VKD3D_BREADCRUMB_COMMAND_ROOT_TABLE,
     VKD3D_BREADCRUMB_COMMAND_ROOT_DESC,
     VKD3D_BREADCRUMB_COMMAND_ROOT_CONST,
     VKD3D_BREADCRUMB_COMMAND_TAG,
@@ -3328,10 +3349,17 @@ struct vkd3d_breadcrumb_tracer
     size_t trace_context_index;
 
     pthread_mutex_t lock;
+
+    pthread_mutex_t barrier_hash_lock;
+    vkd3d_shader_hash_t *barrier_hashes;
+    size_t barrier_hashes_size;
+    uint32_t barrier_hashes_count;
 };
 
 HRESULT vkd3d_breadcrumb_tracer_init(struct vkd3d_breadcrumb_tracer *tracer, struct d3d12_device *device);
+void vkd3d_breadcrumb_tracer_init_barrier_hashes(struct vkd3d_breadcrumb_tracer *tracer);
 void vkd3d_breadcrumb_tracer_cleanup(struct vkd3d_breadcrumb_tracer *tracer, struct d3d12_device *device);
+void vkd3d_breadcrumb_tracer_cleanup_barrier_hashes(struct vkd3d_breadcrumb_tracer *tracer);
 unsigned int vkd3d_breadcrumb_tracer_allocate_command_list(struct vkd3d_breadcrumb_tracer *tracer,
         struct d3d12_command_list *list, struct d3d12_command_allocator *allocator);
 /* Command allocator keeps a list of allocated breadcrumb command lists. */
@@ -3346,6 +3374,10 @@ void vkd3d_breadcrumb_tracer_signal(struct d3d12_command_list *list);
 void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list);
 void vkd3d_breadcrumb_tracer_link_submission(struct d3d12_command_list *list,
         struct d3d12_command_list *prev, struct d3d12_command_list *next);
+
+void vkd3d_breadcrumb_tracer_update_barrier_hashes(struct vkd3d_breadcrumb_tracer *tracer);
+bool vkd3d_breadcrumb_tracer_shader_hash_forces_barrier(
+        struct vkd3d_breadcrumb_tracer *device, vkd3d_shader_hash_t hash);
 
 #define VKD3D_BREADCRUMB_FLUSH_BATCHES(list) do { \
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS) { \
@@ -3862,6 +3894,17 @@ enum vkd3d_predicate_command_type
     VKD3D_PREDICATE_COMMAND_COUNT
 };
 
+enum vkd3d_sampler_feedback_resolve_type
+{
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_MIN_MIP_TO_BUFFER,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_BUFFER_TO_MIN_MIP,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_MIN_MIP_TO_IMAGE,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_IMAGE_TO_MIN_MIP,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_MIP_USED_TO_IMAGE,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_IMAGE_TO_MIP_USED,
+    VKD3D_SAMPLER_FEEDBACK_RESOLVE_COUNT
+};
+
 struct vkd3d_predicate_command_info
 {
     VkPipelineLayout vk_pipeline_layout;
@@ -3972,6 +4015,43 @@ struct vkd3d_meta_ops_common
     VkShaderModule vk_module_fullscreen_gs;
 };
 
+struct vkd3d_sampler_feedback_resolve_info
+{
+    VkPipelineLayout vk_layout;
+    VkPipeline vk_pipeline;
+};
+
+struct vkd3d_sampler_feedback_resolve_decode_args
+{
+    uint32_t src_x, src_y;
+    uint32_t dst_x, dst_y;
+    uint32_t resolve_width, resolve_height;
+    uint32_t paired_width, paired_height;
+    float inv_paired_width, inv_paired_height;
+    float inv_feedback_width, inv_feedback_height;
+    uint32_t num_mip_levels;
+    uint32_t mip_level;
+};
+
+struct vkd3d_sampler_feedback_resolve_encode_args
+{
+    uint32_t src_x, src_y;
+    uint32_t dst_x, dst_y;
+    uint32_t resolve_width, resolve_height;
+    uint32_t src_mip;
+    uint32_t dst_mip;
+};
+
+struct vkd3d_sampler_feedback_resolve_ops
+{
+    VkPipelineLayout vk_compute_encode_layout;
+    VkPipelineLayout vk_compute_decode_layout;
+    VkPipelineLayout vk_graphics_decode_layout;
+    VkDescriptorSetLayout vk_decode_set_layout;
+    VkDescriptorSetLayout vk_encode_set_layout;
+    VkPipeline vk_pipelines[VKD3D_SAMPLER_FEEDBACK_RESOLVE_COUNT];
+};
+
 struct vkd3d_meta_ops
 {
     struct d3d12_device *device;
@@ -3984,6 +4064,7 @@ struct vkd3d_meta_ops
     struct vkd3d_execute_indirect_ops execute_indirect;
     struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
     struct vkd3d_dstorage_ops dstorage;
+    struct vkd3d_sampler_feedback_resolve_ops sampler_feedback;
 };
 
 HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device);
@@ -4028,6 +4109,15 @@ static inline uint32_t vkd3d_meta_get_multi_dispatch_indirect_workgroup_size(voi
 
 HRESULT vkd3d_meta_get_execute_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
         uint32_t patch_command_count, struct vkd3d_execute_indirect_info *info);
+
+void vkd3d_meta_get_sampler_feedback_resolve_pipeline(struct vkd3d_meta_ops *meta_ops,
+        enum vkd3d_sampler_feedback_resolve_type type, struct vkd3d_sampler_feedback_resolve_info *info);
+
+static inline VkExtent3D vkd3d_meta_get_sampler_feedback_workgroup_size(void)
+{
+    VkExtent3D result = { 8, 8, 1 };
+    return result;
+}
 
 enum vkd3d_time_domain_flag
 {
@@ -4529,8 +4619,11 @@ struct d3d12_state_object_identifier
     VkDeviceSize stack_size_any;
     VkDeviceSize stack_size_intersection;
 
-    /* The index into vkGetShaderStackSize and friends for pGroups[]. */
-    uint32_t group_index;
+    /* Index into object->pipelines[]. */
+    uint32_t pipeline_variant_index;
+    /* The index into vkGetShaderStackSize and friends for pGroups[].
+     * Unique per d3d12_state_object_variant */
+    uint32_t per_variant_group_index;
 
     /* For AddToStateObject(). We need to return the identifier pointer
      * for the parent, not the child. This makes it easy to validate that
@@ -4560,6 +4653,33 @@ struct d3d12_state_object_breadcrumb_shader
 };
 #endif
 
+struct d3d12_state_object_variant
+{
+    /* Can be bound. */
+    VkPipeline pipeline;
+    /* Can be used as a library. */
+    VkPipeline pipeline_library;
+    /* The global root signature associated with this variant. */
+    struct d3d12_root_signature *global_root_signature;
+
+    /* For offseting pStages and pGroups for COLLECTIONS. */
+    uint32_t stages_count;
+    uint32_t groups_count;
+
+    struct
+    {
+        VkDescriptorSetLayout set_layout;
+        VkPipelineLayout pipeline_layout;
+        VkDescriptorSet desc_set;
+        VkDescriptorPool desc_pool;
+        uint32_t set_index;
+        uint64_t compatibility_hash;
+        bool owned_handles;
+    } local_static_sampler;
+};
+
+struct d3d12_state_object_pipeline_data;
+
 struct d3d12_state_object
 {
     d3d12_state_object_iface ID3D12StateObject_iface;
@@ -4577,29 +4697,14 @@ struct d3d12_state_object
 
     struct vkd3d_shader_library_entry_point *entry_points;
     size_t entry_points_count;
-    size_t stages_count;
-    /* Normally stages_count == entry_points_count, but entry_points is the entry points we
-     * export externally, and stages_count matches pStages[] size for purposes of index fixups. */
 
-    /* Can be bound. */
-    VkPipeline pipeline;
-    /* Can be used as a library. */
-    VkPipeline pipeline_library;
+    struct d3d12_state_object_variant *pipelines;
+    size_t pipelines_size;
+    size_t pipelines_count;
 
     /* Can be inherited by AddToStateObject(). */
     D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config;
     D3D12_RAYTRACING_SHADER_CONFIG shader_config;
-
-    struct
-    {
-        VkDescriptorSetLayout set_layout;
-        VkPipelineLayout pipeline_layout;
-        VkDescriptorSet desc_set;
-        VkDescriptorPool desc_pool;
-        uint32_t set_index;
-        uint64_t compatibility_hash;
-        bool owned_handles;
-    } local_static_sampler;
 
     UINT64 pipeline_stack_size;
     struct d3d12_state_object_stack_info stack;
@@ -4607,7 +4712,7 @@ struct d3d12_state_object
     struct d3d12_state_object **collections;
     size_t collections_count;
 
-    struct d3d12_root_signature *global_root_signature;
+    struct d3d12_state_object_pipeline_data *deferred_data;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     /* For breadcrumbs. */
@@ -4848,6 +4953,60 @@ static inline unsigned int d3d12_resource_desc_get_depth(const D3D12_RESOURCE_DE
 static inline unsigned int d3d12_resource_desc_get_layer_count(const D3D12_RESOURCE_DESC1 *desc)
 {
     return desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D ? desc->DepthOrArraySize : 1;
+}
+
+static inline bool d3d12_resource_desc_is_sampler_feedback(const D3D12_RESOURCE_DESC1 *desc)
+{
+    return desc->Format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
+            desc->Format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
+}
+
+static inline unsigned int d3d12_resource_desc_get_active_level_count(const D3D12_RESOURCE_DESC1 *desc)
+{
+    return d3d12_resource_desc_is_sampler_feedback(desc) ? 1 : desc->MipLevels;
+}
+
+static inline void vk_extent_3d_from_d3d12_miplevel(VkExtent3D *extent,
+        const D3D12_RESOURCE_DESC1 *resource_desc, unsigned int miplevel_idx)
+{
+    extent->width = d3d12_resource_desc_get_width(resource_desc, miplevel_idx);
+    extent->height = d3d12_resource_desc_get_height(resource_desc, miplevel_idx);
+    extent->depth = d3d12_resource_desc_get_depth(resource_desc, miplevel_idx);
+}
+
+static inline VkExtent3D d3d12_resource_desc_get_active_feedback_extent(const D3D12_RESOURCE_DESC1 *desc,
+        unsigned int mip_level)
+{
+    VkExtent3D result;
+    vk_extent_3d_from_d3d12_miplevel(&result, desc, mip_level);
+    result.width = DIV_ROUND_UP(result.width, desc->SamplerFeedbackMipRegion.Width);
+    result.height = DIV_ROUND_UP(result.height, desc->SamplerFeedbackMipRegion.Height);
+    return result;
+}
+
+static inline VkExtent3D d3d12_resource_desc_get_padded_feedback_extent(const D3D12_RESOURCE_DESC1 *desc)
+{
+    const unsigned int ENCODED_REGION_ALIGNMENT = 16;
+    unsigned int lsb_width, lsb_height;
+    VkExtent3D result, active_result;
+
+    active_result = d3d12_resource_desc_get_active_feedback_extent(desc, 0);
+    lsb_width = vkd3d_log2i(desc->SamplerFeedbackMipRegion.Width);
+    lsb_height = vkd3d_log2i(desc->SamplerFeedbackMipRegion.Height);
+
+    /* Cute trick: Use the lower 4 bits of image size to signal mip region width / height.
+     * We don't rely on specific edge behavior anyway, so this is a neat way of
+     * doing it without changing the binding model *again* ... */
+    result.width = (active_result.width & ~(ENCODED_REGION_ALIGNMENT - 1)) | lsb_width;
+    result.height = (active_result.height & ~(ENCODED_REGION_ALIGNMENT - 1)) | lsb_height;
+    result.depth = 1;
+
+    if (result.width < active_result.width)
+        result.width += ENCODED_REGION_ALIGNMENT;
+    if (result.height < active_result.height)
+        result.height += ENCODED_REGION_ALIGNMENT;
+
+    return result;
 }
 
 static inline unsigned int d3d12_resource_desc_get_sub_resource_count_per_plane(const D3D12_RESOURCE_DESC1 *desc)

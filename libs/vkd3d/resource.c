@@ -187,7 +187,8 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
         if (heap_type == D3D12_HEAP_TYPE_DEFAULT || !is_cpu_accessible_heap(heap_properties))
             buffer_info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
         /* This is always allowed. Used for vertex/index buffer inputs to RTAS build. */
-        buffer_info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        buffer_info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
     }
 
     if (heap_type == D3D12_HEAP_TYPE_UPLOAD)
@@ -840,6 +841,20 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
                 return E_INVALIDARG;
             }
         }
+    }
+
+    /* Sampler feedback images are special.
+     * We need at least ceil(resolution / mip_region_size) of resolution.
+     * In our shader interface we also use the lower 4 bits to signal mip region size.
+     * We can pad the image size just fine since we won't write out of bounds. */
+    if (d3d12_resource_desc_is_sampler_feedback(desc))
+    {
+        image_info->flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        image_info->mipLevels = 1;
+        /* Force the specific usage flags we need. The runtime does not fail if we forget to add UAV usage. */
+        image_info->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        image_info->extent = d3d12_resource_desc_get_padded_feedback_extent(desc);
     }
 
     if (resource)
@@ -2461,6 +2476,54 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
     {
         WARN("MSAA not supported on 1D and 3D textures.\n");
         return E_INVALIDARG;
+    }
+
+    /* There are special validation rules for sampler feedback. */
+    if (d3d12_resource_desc_is_sampler_feedback(desc))
+    {
+        if (device->d3d12_caps.options7.SamplerFeedbackTier == D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED)
+        {
+            WARN("Sampler feedback not supported.\n");
+            return E_INVALIDARG;
+        }
+
+        if (desc->SamplerFeedbackMipRegion.Width < 4 || desc->SamplerFeedbackMipRegion.Height < 4)
+        {
+            WARN("Sampler feedback mip region must be at least 4x4.\n");
+            return E_INVALIDARG;
+        }
+
+        if (desc->SamplerFeedbackMipRegion.Depth > 1)
+        {
+            WARN("Sampler feedback mip region depth must be 0 or 1.\n");
+            return E_INVALIDARG;
+        }
+
+        if (desc->SamplerFeedbackMipRegion.Width * 2 > desc->Width ||
+                desc->SamplerFeedbackMipRegion.Height * 2 > desc->Height)
+        {
+            WARN("Sampler feedback mip region must not be larger than half the texture size.\n");
+            return E_INVALIDARG;
+        }
+
+        if ((desc->SamplerFeedbackMipRegion.Width & (desc->SamplerFeedbackMipRegion.Width - 1)) ||
+                (desc->SamplerFeedbackMipRegion.Height & (desc->SamplerFeedbackMipRegion.Height - 1)))
+        {
+            WARN("Sampler feedback mip region must be POT.\n");
+            return E_INVALIDARG;
+        }
+
+        if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        {
+            WARN("Sampler feedback image cannot declare RTV/DSV usage.\n");
+            return E_INVALIDARG;
+        }
+
+        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        {
+            WARN("Sampler feedback image must be 2D.\n");
+            return E_INVALIDARG;
+        }
     }
 
     switch (desc->Dimension)
@@ -6872,8 +6935,8 @@ static HRESULT d3d12_descriptor_heap_create_descriptor_buffer(struct d3d12_descr
         return S_OK;
 
     descriptor_count = descriptor_heap->desc.NumDescriptors;
-    if (vkd3d_descriptor_debug_active_qa_checks() &&
-            descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    if (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+            d3d12_descriptor_heap_require_padding_descriptors())
     {
         descriptor_count += VKD3D_DESCRIPTOR_DEBUG_NUM_PAD_DESCRIPTORS;
     }
@@ -7872,6 +7935,22 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
     vkd3d_descriptor_debug_unregister_heap(descriptor_heap->cookie);
 }
 
+bool d3d12_descriptor_heap_require_padding_descriptors(void)
+{
+    uint32_t quirks;
+    unsigned int i;
+
+    if (vkd3d_descriptor_debug_active_qa_checks())
+        return true;
+
+    /* If we use descriptor heap robustness, reserve a dummy descriptor we can use
+     * as fake NULL descriptor. */
+    quirks = vkd3d_shader_quirk_info.default_quirks | vkd3d_shader_quirk_info.global_quirks;
+    for (i = 0; i < vkd3d_shader_quirk_info.num_hashes; i++)
+        quirks |= vkd3d_shader_quirk_info.hashes[i].quirks;
+    return !!(quirks & VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS);
+}
+
 static void d3d12_query_heap_set_name(struct d3d12_query_heap *heap, const char *name)
 {
     if (heap->vk_query_pool)
@@ -8404,6 +8483,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
          * Enabling RTAS should not change acceptable memory mask, but to be safe ... */
         buffer_info.usage |=
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     }
 

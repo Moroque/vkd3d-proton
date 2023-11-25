@@ -74,6 +74,7 @@ enum vkd3d_shader_meta_flags
     VKD3D_SHADER_META_FLAG_USES_RASTERIZER_ORDERED_VIEWS = 1 << 13,
     VKD3D_SHADER_META_FLAG_EMITS_LINES = 1 << 14,
     VKD3D_SHADER_META_FLAG_EMITS_TRIANGLES = 1 << 15,
+    VKD3D_SHADER_META_FLAG_FORCE_COMPUTE_BARRIER_AFTER_DISPATCH = 1 << 16,
 };
 
 struct vkd3d_shader_meta
@@ -416,6 +417,15 @@ enum vkd3d_shader_quirk
 
     /* Driver workaround hackery. Try to rewrite weird Grads to plain Bias. */
     VKD3D_SHADER_QUIRK_REWRITE_GRAD_TO_BIAS = (1 << 12),
+
+    /* Driver workarounds. Force loops to not be unrolled with SPIR-V control masks. */
+    VKD3D_SHADER_QUIRK_FORCE_LOOP = (1 << 13),
+
+    /* Requests META_FLAG_FORCE_COMPUTE_BARRIER_AFTER_DISPATCH to be set in shader meta. */
+    VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER = (1 << 14),
+
+    /* Range check every descriptor heap access with dynamic index and robustness check it. */
+    VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS = (1 << 15),
 };
 
 struct vkd3d_shader_quirk_hash
@@ -931,6 +941,9 @@ struct vkd3d_shader_library_entry_point
     unsigned int identifier;
     VkShaderStageFlagBits stage;
 
+    uint32_t pipeline_variant_index;
+    uint32_t stage_index;
+
     /* For implementing the API, since it uses WCHAR despite C++ identifiers being ASCII ... */
     WCHAR *mangled_entry_point;
     WCHAR *plain_entry_point;
@@ -956,14 +969,17 @@ enum vkd3d_shader_subobject_kind
 struct vkd3d_shader_library_subobject
 {
     enum vkd3d_shader_subobject_kind kind;
-    unsigned int dxil_identifier;
 
     /* All const pointers here point directly to the DXBC blob,
      * so they do not need to be freed.
      * Fortunately for us, the C strings are zero-terminated in the blob itself. */
 
-    /* In the blob, ASCII is used as identifier, where API uses wide strings, sigh ... */
-    const char *name;
+    /* In the blob, ASCII is used as identifier, where API uses wide strings, sigh ...
+     * We need to dup this name for deferred COLLECTIONS, so use wchar instead. */
+    WCHAR *name;
+
+    /* If true, any pointers below are just borrowed. */
+    bool borrowed_payloads;
 
     union
     {
@@ -977,7 +993,8 @@ struct vkd3d_shader_library_subobject
 
         struct
         {
-            const void *data;
+            /* Duped because of deferred COLLECTIONS. */
+            void *data;
             size_t size;
         } payload;
     } data;
